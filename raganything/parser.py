@@ -169,6 +169,38 @@ class Parser:
         pass
 
     @staticmethod
+    def _libreoffice_candidates() -> List[str]:
+        """Return LibreOffice executables available on this machine."""
+        candidates: List[str] = []
+
+        if _IS_WINDOWS:
+            candidates.extend(
+                [
+                    r"C:\Program Files\LibreOffice\program\soffice.exe",
+                    r"C:\Program Files (x86)\LibreOffice\program\soffice.exe",
+                ]
+            )
+            commands = ["soffice.exe", "libreoffice.exe", "soffice", "libreoffice"]
+        else:
+            commands = ["libreoffice", "soffice"]
+
+        for command in commands:
+            resolved = shutil.which(command)
+            if resolved:
+                candidates.append(resolved)
+
+        seen = set()
+        unique_candidates: List[str] = []
+        for candidate in candidates:
+            candidate_path = str(Path(candidate))
+            candidate_key = candidate_path.lower() if _IS_WINDOWS else candidate_path
+            if candidate_key not in seen and Path(candidate_path).exists():
+                seen.add(candidate_key)
+                unique_candidates.append(candidate_path)
+
+        return unique_candidates
+
+    @staticmethod
     def _unique_output_dir(
         base_dir: Union[str, Path], file_path: Union[str, Path]
     ) -> Path:
@@ -232,7 +264,9 @@ class Parser:
 
                 # Prepare subprocess parameters to hide console window on Windows
                 # Try LibreOffice commands in order of preference
-                commands_to_try = ["libreoffice", "soffice"]
+                commands_to_try = cls._libreoffice_candidates()
+                if not commands_to_try:
+                    commands_to_try = ["libreoffice", "soffice"]
 
                 conversion_successful = False
                 last_cmd = commands_to_try[-1]

@@ -15,16 +15,53 @@ Usage:
 
 import argparse
 import asyncio
+import platform
+import shutil
 import sys
 from pathlib import Path
 from raganything import RAGAnything
+
+
+def get_libreoffice_candidates():
+    """Return LibreOffice executables that can be used on this machine."""
+    candidates = []
+
+    if platform.system() == "Windows":
+        candidates.extend(
+            [
+                r"C:\Program Files\LibreOffice\program\soffice.exe",
+                r"C:\Program Files (x86)\LibreOffice\program\soffice.exe",
+            ]
+        )
+        commands = ["soffice.exe", "libreoffice.exe", "soffice", "libreoffice"]
+    else:
+        commands = ["libreoffice", "soffice"]
+
+    for command in commands:
+        resolved = shutil.which(command)
+        if resolved:
+            candidates.append(resolved)
+
+    seen = set()
+    unique_candidates = []
+    for candidate in candidates:
+        candidate_path = str(Path(candidate))
+        if candidate_path.lower() not in seen and Path(candidate_path).exists():
+            seen.add(candidate_path.lower())
+            unique_candidates.append(candidate_path)
+
+    return unique_candidates
 
 
 def check_libreoffice_installation():
     """Check if LibreOffice is installed and available"""
     import subprocess
 
-    for cmd in ["libreoffice", "soffice"]:
+    for cmd in get_libreoffice_candidates():
+        if platform.system() == "Windows":
+            print(f"✅ LibreOffice found: {cmd}")
+            return True
+
         try:
             result = subprocess.run(
                 [cmd, "--version"], capture_output=True, check=True, timeout=10
