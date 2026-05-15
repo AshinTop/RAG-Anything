@@ -3,14 +3,17 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 import sys
 import hashlib
+import json
 import shutil
 import subprocess
 import time
 from datetime import datetime
+from datetime import timezone
 from pathlib import Path
 from typing import Any
 
@@ -83,11 +86,436 @@ QWEN_POLICY_GUARD = (
 )
 
 ANSWER_SYSTEM_PROMPT = (
-    "请始终使用自然、正式的简体中文回答。回答必须基于检索到的政策原文、"
-    "知识图谱实体和关系，不要编造未在资料中出现的政策要求。"
-    "涉及条款、适用范围、指标、数值、单位、发布机构和文件名称时，"
-    "优先保留原文中文表述；无法从资料中确认时，请明确说明资料中未检索到。"
+    "/no_think\n"
+    "你是中文政策文件问答助手。必须只依据本轮检索上下文中的政策原文回答；"
+    "知识图谱实体和关系只能作为定位线索，不能作为最终答案依据，不能覆盖政策原文。"
+    "不得使用模型自身知识补充、推断、替换或改写政策结论。"
+    "先识别用户问题中的核心对象、章节名、工程类型、指标名或条款主题，然后只使用"
+    "与该核心对象精确匹配或直接相邻的原文内容作答。"
+    "如果检索上下文中存在与问题核心对象同名的章节标题、条款或表格，必须优先使用"
+    "这些内容，不要使用其他相似主题、其他文件或外部标准。"
+    "如果原文 chunk 中出现明确条款、表格或指标，必须逐条展开相关内容，"
+    "不要只给一句概括。涉及适用范围、指标、数值、单位、发布机构、文件名称时，"
+    "必须保留原文中的工程名称、条件、数值和单位。"
+    "当问题询问“如何规定”“建设用地如何规定”“指标如何规定”时，答案至少应覆盖"
+    "原文中可检索到的分类/分级、用地组成、面积或容量控制、比例要求、上下限说明、"
+    "计算或适用条件；如果某项在原文中没有出现，可省略，不得编造。"
+    "禁止引用检索上下文中没有逐字出现的文件名、标准号、法规名称、机构名称或数值，"
+    "例如不得凭常识补充其他国家标准、地方标准、规划标准或主管部门建议。"
+    "禁止输出占位符或模板内容，例如“第X条”“页码 X”“XX平方米”“具体数值需另查”。"
+    "禁止把相似但不同的主题混为一谈；必须优先使用与用户问题核心对象、章节、条款"
+    "或表格最匹配的检索内容。"
+    "不得判断“项目不适用”“不在适用范围内”或给出否定结论，除非检索上下文"
+    "明确写出了该否定结论。"
+    "如果政策原文和知识图谱信息冲突，以政策原文为准；如果原文没有足够依据，"
+    "请回答“资料中未检索到相关依据”，不要编造。"
+    "回答必须使用以下结构，不要增加其他标题：\n"
+    "结论：\n"
+    "用 2-5 句话直接回答问题，覆盖检索原文中与问题相关的主要条款和表格结论；"
+    "如果资料不足，明确说明未检索到相关依据。\n\n"
+    "依据：\n"
+    "按条目说明依据来自哪些原文条款、表格或指标。每条依据应包含条款号或表格名，"
+    "并保留原文中的关键规定、规模分类、面积指标、比例、上下限和单位。"
+    "如果同一问题涉及多个连续条款，应尽量列全，不要遗漏关键条款。\n\n"
+    "补充说明：\n"
+    "只说明检索原文中明确存在的适用限制、计算条件或口径。"
+    "如果原文已经足以回答且没有额外限制，写“无”。"
+    "只有在确实未检索到依据时，才给出获取资料的建议。\n\n"
+    "参考来源：\n"
+    "列出使用到的来源。如果检索内容明确包含页码，格式为“1. 页码 N - 《文件名》”；"
+    "如果没有明确页码，格式为“1. 《文件名》”，不要写“页码 X”或“页码未标明”。"
+    "同一文件重复引用时可以合并为一条。"
 )
+
+STRICT_ANSWER_SYSTEM_PROMPT = (
+    "/no_think\n"
+    "你是中文政策原文抽取式问答助手。用户会提供带 metadata 的问题相关原文片段。"
+    "你的任务不是自由问答，而是从这些片段中抽取原文依据并组织答案。\n"
+    "必须遵守：\n"
+    "1. 只使用检索提示中逐字出现的信息；禁止使用任何外部知识、常识、标准号、文件名、"
+    "章节号、页码、数值或建议。\n"
+    "2. 先在原文片段中定位与用户问题核心对象最匹配的标题、条款或表格；如果存在，"
+    "只围绕这些原文回答。\n"
+    "3. 不得输出检索提示中没有逐字出现的文件名、标准名称、条款号、页码、面积、距离、"
+    "比例或下限。禁止输出“第X条”“页码 X”“XX平方米”等占位符。\n"
+    "4. 如果问题问“如何规定”，应尽量覆盖原文中的分类/分级、用地组成、容量或面积控制、"
+    "比例要求、上下限说明、适用条件。只要原文出现了这些内容，就不要省略。\n"
+    "对于连续条款，不要只列前两条；必须继续检查后续条款，直到该小节结束或进入下一节。\n"
+    "如果片段含相同“章节路径”的多条内容或表格，必须综合这些同章节内容回答，不要只使用第一条。\n"
+    "5. 答案必须使用以下结构：\n"
+    "结论：\n"
+    "依据：\n"
+    "补充说明：\n"
+    "参考来源：\n"
+    "6. 没有明确页码时，参考来源只写“《文件名》”；不要写页码 X 或页码未标明。"
+)
+
+
+def build_strict_answer_prompt(raw_prompt: str, question: str, focused_context: str | None = None) -> str:
+    focused_context = focused_context or extract_focused_context(raw_prompt, question)
+    return f"""/no_think
+请根据下面的“问题相关原文片段”回答用户问题。
+
+用户问题：
+{question}
+
+问题相关原文片段：
+```
+{focused_context}
+```
+
+只能使用上方原文片段。不要使用外部知识，不要引用上方片段没有出现的文件名、标准号、条款号、页码、数值或单位。
+"""
+
+
+async def load_index_chunks(working_dir: str, storage: str) -> list[dict[str, Any]]:
+    if storage in {"postgres", "postgres-age"}:
+        return await load_postgres_chunks()
+    return load_local_chunks(Path(working_dir))
+
+
+async def load_postgres_chunks() -> list[dict[str, Any]]:
+    try:
+        import asyncpg
+    except ImportError:
+        return []
+
+    workspace = (
+        os.getenv("PG_WORKSPACE")
+        or os.getenv("POSTGRES_WORKSPACE")
+        or os.getenv("QWEN_POSTGRES_WORKSPACE")
+        or "default"
+    )
+    connection = await asyncpg.connect(
+        host=os.getenv("POSTGRES_HOST") or os.getenv("PGHOST") or "localhost",
+        port=int(os.getenv("POSTGRES_PORT") or os.getenv("PGPORT") or "5432"),
+        user=os.getenv("POSTGRES_USER") or os.getenv("PGUSER") or "postgres",
+        password=os.getenv("POSTGRES_PASSWORD") or os.getenv("PGPASSWORD"),
+        database=os.getenv("POSTGRES_DATABASE") or os.getenv("PGDATABASE") or "postgres",
+    )
+    try:
+        rows = await connection.fetch(
+            """
+            SELECT id, workspace, full_doc_id, chunk_order_index, content, file_path
+            FROM LIGHTRAG_VDB_CHUNKS
+            WHERE workspace = $1
+            ORDER BY full_doc_id, chunk_order_index
+            """,
+            workspace,
+        )
+        return [dict(row) for row in rows]
+    finally:
+        await connection.close()
+
+
+def load_local_chunks(working_dir: Path) -> list[dict[str, Any]]:
+    chunks_path = working_dir / "kv_store_text_chunks.json"
+    if not chunks_path.exists():
+        return []
+    with chunks_path.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        return []
+
+    chunks: list[dict[str, Any]] = []
+    for index, (chunk_id, value) in enumerate(data.items()):
+        if not isinstance(value, dict):
+            continue
+        chunks.append(
+            {
+                "id": chunk_id,
+                "workspace": "local",
+                "full_doc_id": value.get("full_doc_id") or value.get("doc_id") or "",
+                "chunk_order_index": value.get("chunk_order_index", index),
+                "content": value.get("content") or value.get("text") or "",
+                "file_path": value.get("file_path") or value.get("source") or "",
+            }
+        )
+    return sorted(chunks, key=lambda item: (item.get("full_doc_id") or "", int(item.get("chunk_order_index") or 0)))
+
+
+async def insert_retrieval_only_chunks(
+    rag: RAGAnything,
+    *,
+    doc_id: str,
+    source_ref: str,
+    chunk_texts: list[str],
+    chunk_ids: list[str],
+    full_text: str | None = None,
+) -> None:
+    """Insert chunks for retrieval QA without running KG extraction.
+
+    This writes full docs, text chunks, vectors, and doc_status so the policy QA
+    path can rely on structured retrieval and citations even when small local
+    models are not stable enough for entity/relation extraction.
+    """
+    if rag.lightrag is None:
+        raise RuntimeError("LightRAG is not initialized")
+    if len(chunk_texts) != len(chunk_ids):
+        raise ValueError("chunk_texts and chunk_ids must have the same length")
+    if not chunk_texts:
+        raise ValueError("chunk_texts must not be empty")
+
+    file_ref = rag._get_file_reference(source_ref)
+    timestamp = datetime.now(timezone.utc)
+    tokenizer = rag.lightrag.tokenizer
+
+    prepared_chunks: dict[str, dict[str, Any]] = {}
+    normalized_texts: list[str] = []
+    for index, (chunk_id, chunk_text) in enumerate(zip(chunk_ids, chunk_texts)):
+        normalized_text = str(chunk_text or "").strip()
+        if not normalized_text:
+            continue
+        normalized_texts.append(normalized_text)
+        prepared_chunks[chunk_id] = {
+            "content": normalized_text,
+            "tokens": len(tokenizer.encode(normalized_text)),
+            "full_doc_id": doc_id,
+            "chunk_order_index": index,
+            "file_path": file_ref,
+            "llm_cache_list": [],
+        }
+
+    if not prepared_chunks:
+        raise ValueError("No non-empty chunk text available for insertion")
+
+    full_doc_text = full_text or "\n\n".join(normalized_texts)
+    full_doc_record = {
+        doc_id: {
+            "content": full_doc_text,
+            "file_path": file_ref,
+        }
+    }
+    doc_status_record = {
+        doc_id: {
+            "status": "processed",
+            "chunks_count": len(prepared_chunks),
+            "chunks_list": list(prepared_chunks.keys()),
+            "content_summary": full_doc_text[:240],
+            "content_length": len(full_doc_text),
+            "created_at": timestamp,
+            "updated_at": timestamp,
+            "file_path": file_ref,
+            "metadata": {
+                "ingest_strategy": "retrieval_only",
+                "qa_strategy": "structured_retrieval_first",
+                "kg_extraction": "skipped",
+            },
+        }
+    }
+
+    await rag.lightrag.full_docs.upsert(full_doc_record)
+    await rag.lightrag.full_docs.index_done_callback()
+
+    await rag.lightrag.text_chunks.upsert(prepared_chunks)
+    await rag.lightrag.text_chunks.index_done_callback()
+
+    await rag.lightrag.chunks_vdb.upsert(prepared_chunks)
+    await rag.lightrag.chunks_vdb.index_done_callback()
+
+    await rag.lightrag.doc_status.upsert(doc_status_record)
+    await rag.lightrag.doc_status.index_done_callback()
+
+    stored_full_doc = await rag.lightrag.full_docs.get_by_id(doc_id)
+    if not stored_full_doc:
+        raise RuntimeError(f"retrieval-only full_docs 写入失败: {doc_id}")
+
+    stored_doc_status = await rag.lightrag.doc_status.get_by_id(doc_id)
+    if not stored_doc_status:
+        raise RuntimeError(f"retrieval-only doc_status 写入失败: {doc_id}")
+
+    stored_chunk_vectors = await rag.lightrag.chunks_vdb.get_by_ids(
+        list(prepared_chunks.keys())
+    )
+    if not stored_chunk_vectors:
+        raise RuntimeError(
+            f"retrieval-only vdb_chunks 写入失败: doc_id={doc_id}, chunks={len(prepared_chunks)}"
+        )
+
+
+def build_chunk_focused_context(
+    chunks: list[dict[str, Any]], question: str, *, max_chunks: int = 8
+) -> str:
+    if not chunks:
+        return ""
+
+    terms = build_focus_terms(question)
+    high_priority_terms = terms
+
+    scored: list[tuple[int, int, dict[str, Any]]] = []
+    for index, chunk in enumerate(chunks):
+        content = str(chunk.get("content") or "")
+        score = score_focus_snippet(content, terms, high_priority_terms)
+        scored.append((score, index, chunk))
+
+    scored.sort(key=lambda item: item[0], reverse=True)
+    if not scored or scored[0][0] <= 0:
+        selected_indexes = [index for _, index, _ in scored[:max_chunks]]
+    else:
+        _, top_index, top_chunk = scored[0]
+        selected_indexes = [top_index]
+        top_doc_id = top_chunk.get("full_doc_id")
+        top_meta = parse_structured_chunk_metadata(str(top_chunk.get("content") or ""))
+        top_section_path = top_meta.get("章节路径")
+
+        # Include only close adjacent chunks that still look related. This keeps
+        # cross-chunk clauses/tables while avoiding drift into the next section.
+        for offset in [1, -1]:
+            neighbor_index = top_index + offset
+            if 0 <= neighbor_index < len(chunks):
+                neighbor = chunks[neighbor_index]
+                neighbor_content = str(neighbor.get("content") or "")
+                if (
+                    neighbor.get("full_doc_id") == top_doc_id
+                    and is_related_neighbor(neighbor_content, high_priority_terms)
+                ):
+                    selected_indexes.append(neighbor_index)
+            if len(selected_indexes) >= max_chunks:
+                break
+
+        if top_section_path:
+            for neighbor_index, neighbor in enumerate(chunks):
+                if len(selected_indexes) >= max_chunks:
+                    break
+                if neighbor_index in selected_indexes:
+                    continue
+                if neighbor.get("full_doc_id") != top_doc_id:
+                    continue
+                neighbor_meta = parse_structured_chunk_metadata(
+                    str(neighbor.get("content") or "")
+                )
+                if neighbor_meta.get("章节路径") != top_section_path:
+                    continue
+                selected_indexes.append(neighbor_index)
+
+    selected_indexes = sorted(dict.fromkeys(selected_indexes))
+    parts: list[str] = []
+    for ref_index, chunk_index in enumerate(selected_indexes, start=1):
+        chunk = chunks[chunk_index]
+        file_path = Path(str(chunk.get("file_path") or "")).name or "来源未标明"
+        order = chunk.get("chunk_order_index")
+        parts.append(
+            f"[参考内容{ref_index}]\n"
+            f"chunk_id: {chunk.get('id')}\n"
+            f"chunk_order_index: {order}\n"
+            f"文件: 《{file_path}》\n"
+            f"原文:\n{str(chunk.get('content') or '').strip()}"
+        )
+    return "\n\n---\n\n".join(parts)
+
+
+def is_related_neighbor(content: str, high_priority_terms: list[str]) -> bool:
+    return any(term and term in content for term in high_priority_terms)
+
+
+def parse_structured_chunk_metadata(content: str) -> dict[str, str]:
+    metadata: dict[str, str] = {}
+    for line in str(content or "").splitlines():
+        stripped = line.strip()
+        if stripped == "正文：":
+            break
+        if "：" not in stripped:
+            continue
+        key, value = stripped.split("：", 1)
+        if key in {
+            "文件",
+            "chunk_id",
+            "chunk_order_index",
+            "内容类型",
+            "页码",
+            "章节路径",
+            "条款",
+        }:
+            metadata[key] = value.strip()
+    return metadata
+
+
+def extract_focused_context(raw_prompt: str, question: str, window: int = 1800) -> str:
+    """Extract query-focused snippets so small local LLMs do not drift to nearby topics."""
+    if not raw_prompt:
+        return ""
+
+    terms = build_focus_terms(question)
+    generic_terms = {"建设用地", "用地面积", "用地指标"}
+    high_priority_terms = [term for term in terms if term not in generic_terms]
+    candidates: list[tuple[int, int, int, str]] = []
+
+    for term in terms:
+        if not term:
+            continue
+        for match in re.finditer(re.escape(term), raw_prompt):
+            start = max(0, match.start() - window)
+            end = min(len(raw_prompt), match.end() + window)
+            snippet = raw_prompt[start:end].strip()
+            score = score_focus_snippet(snippet, terms, high_priority_terms)
+            candidates.append((score, start, end, snippet))
+
+    if not candidates:
+        return raw_prompt
+
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    snippets: list[str] = []
+    used_ranges: list[tuple[int, int]] = []
+
+    for score, start, end, snippet in candidates:
+        if score <= 0:
+            continue
+        if any(not (end < old_start or start > old_end) for old_start, old_end in used_ranges):
+            continue
+        used_ranges.append((start, end))
+        snippets.append(snippet)
+        if len(snippets) >= 3:
+            break
+
+    return "\n\n---\n\n".join(snippets) if snippets else raw_prompt
+
+
+def score_focus_snippet(
+    snippet: str, terms: list[str], high_priority_terms: list[str]
+) -> int:
+    score = 0
+    for term in high_priority_terms:
+        if term in snippet:
+            score += 100 + len(term) * 5
+    for term in terms:
+        if term in snippet:
+            score += snippet.count(term) * max(1, len(term))
+
+    if re.search(r"第[一二三四五六七八九十百零〇\d]+条", snippet):
+        score += 40
+    if "表格" in snippet or "<table" in snippet:
+        score += 30
+    if "工程项目" in snippet:
+        score += 20
+
+    # Avoid snippets that only match broad words such as "建设用地".
+    if not any(term in snippet for term in high_priority_terms):
+        score -= 200
+    return score
+
+
+def build_focus_terms(question: str) -> list[str]:
+    text = re.sub(r"[？?，,。；;：:\s]+", "", question or "")
+
+    terms: list[str] = []
+    if len(text) >= 4:
+        terms.append(text)
+
+    # Generate long n-grams directly from the question instead of maintaining
+    # domain-specific stop-word lists.
+    for size in range(min(12, len(text)), 3, -1):
+        for index in range(0, max(0, len(text) - size + 1)):
+            gram = text[index : index + size]
+            if gram not in terms:
+                terms.append(gram)
+        if len(terms) >= 10:
+            break
+
+    deduped: list[str] = []
+    for term in terms:
+        if term and term not in deduped:
+            deduped.append(term)
+    return deduped
 
 
 def env_bool(name: str, default: bool) -> bool:
@@ -187,6 +615,9 @@ def strip_qwen_thinking(text: str) -> str:
     text = re.sub(
         r"<thinking>.*?</thinking>", "", text, flags=re.DOTALL | re.IGNORECASE
     )
+    # Some Qwen3-compatible servers omit the opening tag but still return
+    # reasoning followed by a closing tag.
+    text = re.sub(r"^.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE)
     return text.strip()
 
 
@@ -266,10 +697,13 @@ def apply_chinese_policy_prompts() -> None:
    - 实体名称应使用原文中文名称，机构、文件名、条款名、指标名、工程名称和数值单位不要随意改写。
    - 实体类型必须从以下类型中选择：{entity_types}。如果都不适用，使用“其他”。
    - 实体描述必须只依据输入文本，简洁说明该实体在政策中的身份、属性、职责、适用条件或指标含义。
+   - 如果输入文本含有“文件、章节路径、条款、页码、正文”等元数据，实体描述必须保留相关条款号、章节路径或页码。
 
 2. 关系抽取：
    - 抽取实体之间明确存在的政策关系，例如“发布/批准/适用于/规定/包含/对应/要求/限定/计算依据/取值为”。
    - 关系描述必须说明关系依据，尽量保留原文中的条件、范围、数值和单位。
+   - 关系只能来自当前输入文本中的明确表述，不允许跨条款、跨章节或凭常识推断。
+   - 关系描述必须包含能回溯的 evidence；如果输入文本含条款号或页码，应写入关系描述。
 
 3. 输出格式：
    - 每个实体一行，字段用 `{tuple_delimiter}` 分隔，格式必须为：
@@ -283,13 +717,15 @@ def apply_chinese_policy_prompts() -> None:
 """
 
     LIGHTRAG_PROMPTS["entity_extraction_user_prompt"] = """---任务---
-请从下面“待处理文本”中抽取中文政策知识图谱的实体和关系。
+请从下面“待处理文本”中抽取中文政策知识图谱的实体和关系。待处理文本可能包含结构化 metadata，例如文件、章节路径、条款、页码和正文。
 
 ---要求---
 1. 严格遵守系统提示中的实体、关系字段顺序和分隔符。
 2. 只输出实体和关系列表，不要添加开场白、总结或解释。
 3. 抽取完成后，最后一行必须输出 `{completion_delimiter}`。
 4. 输出语言必须为{language}。
+5. 实体或关系描述必须绑定当前文本中的 evidence；优先保留“条款：...”“章节路径：...”“页码：...”。
+6. 不要抽取当前文本没有明确说明的适用范围、指标、数值或关系。
 
 ---待处理文本---
 <实体类型>
@@ -316,7 +752,9 @@ def apply_chinese_policy_prompts() -> None:
 5. 最后一行必须输出 `{completion_delimiter}`。
 6. 关系行总共只能有 5 个字段，第一字段必须是 `relation`，不要输出关系强度、评分或额外字段。
 7. 不允许输出 4 字段关系行；缺少关键词时使用“相关”作为第 4 个字段。
-8. 输出语言必须为{language}，不要添加解释、Markdown 或代码块。
+8. 描述必须包含当前输入中的 evidence；优先保留“条款：...”“章节路径：...”“页码：...”。
+9. 不要跨条款或跨章节推断关系。
+10. 输出语言必须为{language}，不要添加解释、Markdown 或代码块。
 
 ---输入文本---
 ```
@@ -417,6 +855,10 @@ def get_qwen_settings() -> dict[str, Any]:
             os.getenv("QWEN_EMBEDDING_MAX_TOKENS")
             or os.getenv("EMBEDDING_MAX_TOKENS", "8192")
         ),
+        "embedding_timeout": int(
+            os.getenv("QWEN_EMBEDDING_TIMEOUT")
+            or os.getenv("EMBEDDING_TIMEOUT", "180")
+        ),
         "timeout": int(os.getenv("QWEN_TIMEOUT", "180")),
         "temperature": float(os.getenv("QWEN_TEMPERATURE", "0")),
     }
@@ -477,6 +919,9 @@ def make_lightrag_kwargs(
     settings: dict[str, Any], storage: str | None = None
 ) -> dict[str, Any]:
     backends = storage_backend_names(storage)
+    llm_timeout = int(
+        os.getenv("QWEN_DEFAULT_LLM_TIMEOUT", str(settings["timeout"]))
+    )
     return {
         **backends,
         "llm_model_name": settings["llm_model"],
@@ -488,8 +933,13 @@ def make_lightrag_kwargs(
         "summary_context_size": int(os.getenv("QWEN_SUMMARY_CONTEXT_SIZE", "8000")),
         "summary_length_recommended": int(os.getenv("QWEN_SUMMARY_LENGTH", "450")),
         "llm_model_max_async": int(os.getenv("QWEN_LLM_MAX_ASYNC", "1")),
+        "default_llm_timeout": llm_timeout,
+        "llm_model_kwargs": {
+            "timeout": llm_timeout,
+        },
         "embedding_batch_num": int(os.getenv("QWEN_EMBEDDING_BATCH_NUM", "4")),
         "embedding_func_max_async": int(os.getenv("QWEN_EMBEDDING_MAX_ASYNC", "1")),
+        "default_embedding_timeout": int(settings["embedding_timeout"]),
         "max_parallel_insert": int(os.getenv("QWEN_MAX_PARALLEL_INSERT", "1")),
         "entity_extract_max_gleaning": int(os.getenv("QWEN_ENTITY_MAX_GLEANING", "1")),
         "enable_llm_cache": env_bool("QWEN_ENABLE_LLM_CACHE", True),

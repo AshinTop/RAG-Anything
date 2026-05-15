@@ -105,6 +105,43 @@ class RAGAnything(QueryMixin, ProcessorMixin, BatchMixin):
     _parser_installation_checked: bool = field(default=False, init=False)
     """Flag to track if parser installation has been checked."""
 
+    async def _initialize_optional_kv_storage(self, namespace: str) -> Optional[Any]:
+        """Initialize an auxiliary KV namespace when the backend supports it.
+
+        Some LightRAG storage backends, notably older PostgreSQL implementations,
+        only recognize the built-in namespaces from `lightrag.namespace.NameSpace`.
+        RAGAnything adds `parse_cache` and `multimodal_status` as extra namespaces.
+        When the backend rejects them, we gracefully disable the auxiliary cache
+        instead of failing the import path or emitting repeated runtime warnings.
+        """
+        if self.lightrag is None:
+            raise ValueError("LightRAG must be initialized before auxiliary storages")
+
+        storage = self.lightrag.key_string_value_json_storage_cls(
+            namespace=namespace,
+            workspace=self.lightrag.workspace,
+            global_config=self.lightrag.__dict__,
+            embedding_func=self.embedding_func,
+        )
+        await storage.initialize()
+
+        try:
+            await storage.get_by_id("__raganything_namespace_probe__")
+        except (KeyError, ValueError) as exc:
+            if isinstance(exc, KeyError) or "Unknown namespace" in str(exc):
+                self.logger.warning(
+                    "KV storage backend does not support namespace '%s'; disabling this auxiliary cache",
+                    namespace,
+                )
+                try:
+                    await storage.finalize()
+                except Exception:
+                    pass
+                return None
+            raise
+
+        return storage
+
     def __post_init__(self):
         """Post-initialization setup following LightRAG pattern"""
         # Initialize configuration if not provided
@@ -307,29 +344,19 @@ class RAGAnything(QueryMixin, ProcessorMixin, BatchMixin):
                         self.logger.info(
                             "Initializing parse cache for pre-provided LightRAG instance"
                         )
-                        self.parse_cache = (
-                            self.lightrag.key_string_value_json_storage_cls(
-                                namespace="parse_cache",
-                                workspace=self.lightrag.workspace,
-                                global_config=self.lightrag.__dict__,
-                                embedding_func=self.embedding_func,
-                            )
+                        self.parse_cache = await self._initialize_optional_kv_storage(
+                            "parse_cache"
                         )
-                        await self.parse_cache.initialize()
 
                     if self.multimodal_status_cache is None:
                         self.logger.info(
                             "Initializing multimodal status cache for pre-provided LightRAG instance"
                         )
                         self.multimodal_status_cache = (
-                            self.lightrag.key_string_value_json_storage_cls(
-                                namespace="multimodal_status",
-                                workspace=self.lightrag.workspace,
-                                global_config=self.lightrag.__dict__,
-                                embedding_func=self.embedding_func,
+                            await self._initialize_optional_kv_storage(
+                                "multimodal_status"
                             )
                         )
-                        await self.multimodal_status_cache.initialize()
 
                     # Initialize processors if not already done
                     if not self.modal_processors:
@@ -383,23 +410,13 @@ class RAGAnything(QueryMixin, ProcessorMixin, BatchMixin):
                 await initialize_pipeline_status()
 
                 # Initialize parse cache storage using LightRAG's KV storage
-                self.parse_cache = self.lightrag.key_string_value_json_storage_cls(
-                    namespace="parse_cache",
-                    workspace=self.lightrag.workspace,
-                    global_config=self.lightrag.__dict__,
-                    embedding_func=self.embedding_func,
+                self.parse_cache = await self._initialize_optional_kv_storage(
+                    "parse_cache"
                 )
-                await self.parse_cache.initialize()
 
                 self.multimodal_status_cache = (
-                    self.lightrag.key_string_value_json_storage_cls(
-                        namespace="multimodal_status",
-                        workspace=self.lightrag.workspace,
-                        global_config=self.lightrag.__dict__,
-                        embedding_func=self.embedding_func,
-                    )
+                    await self._initialize_optional_kv_storage("multimodal_status")
                 )
-                await self.multimodal_status_cache.initialize()
 
                 # Initialize processors after LightRAG is ready
                 self._initialize_processors()

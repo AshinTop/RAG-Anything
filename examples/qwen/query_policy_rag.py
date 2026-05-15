@@ -11,9 +11,14 @@ from pathlib import Path
 from qwen_policy_common import (
     ANSWER_SYSTEM_PROMPT,
     DEFAULT_WORKING_DIR,
+    STRICT_ANSWER_SYSTEM_PROMPT,
+    build_chunk_focused_context,
+    build_strict_answer_prompt,
     build_qwen_policy_rag,
+    load_index_chunks,
     normalize_storage,
 )
+from lightrag import QueryParam
 
 
 def local_index_has_chunks(working_dir: Path) -> bool:
@@ -76,17 +81,44 @@ async def query(args: argparse.Namespace) -> None:
         raise RuntimeError("请传入一个问题，或用 -q 传入多个问题。")
 
     try:
+        index_chunks = await load_index_chunks(args.working_dir, storage) if args.strict_answer else []
         for index, question in enumerate(questions, start=1):
             print(f"\n[{index}] Q: {question}\n", flush=True)
-            answer = await rag.aquery(
-                question,
-                mode=args.mode,
-                system_prompt=args.system_prompt,
-                top_k=args.top_k,
-                chunk_top_k=args.chunk_top_k,
-                enable_rerank=args.enable_rerank,
-                vlm_enhanced=args.vlm,
-            )
+            if args.strict_answer:
+                raw_prompt = await rag.lightrag.aquery(
+                    question,
+                    param=QueryParam(
+                        mode=args.mode,
+                        top_k=args.top_k,
+                        chunk_top_k=args.chunk_top_k,
+                        enable_rerank=args.enable_rerank,
+                        only_need_prompt=True,
+                    ),
+                )
+                if args.dump_prompt:
+                    print("RAW PROMPT:\n")
+                    print(raw_prompt)
+                    print("\n--- END RAW PROMPT ---\n")
+                focused_context = build_chunk_focused_context(index_chunks, question)
+                if args.dump_prompt and focused_context:
+                    print("FOCUSED CONTEXT:\n")
+                    print(focused_context)
+                    print("\n--- END FOCUSED CONTEXT ---\n")
+                answer = await rag.llm_model_func(
+                    build_strict_answer_prompt(raw_prompt, question, focused_context),
+                    system_prompt=args.system_prompt,
+                    temperature=0,
+                )
+            else:
+                answer = await rag.aquery(
+                    question,
+                    mode=args.mode,
+                    system_prompt=args.system_prompt,
+                    top_k=args.top_k,
+                    chunk_top_k=args.chunk_top_k,
+                    enable_rerank=args.enable_rerank,
+                    vlm_enhanced=args.vlm,
+                )
             print("A:\n")
             print(answer)
     finally:
@@ -127,9 +159,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--mode",
-        default="hybrid",
+        default="naive",
         choices=["hybrid", "local", "global", "naive", "mix", "bypass"],
-        help="LightRAG 查询模式。",
+        help="LightRAG 查询模式；中文政策原文问答默认使用 naive，避免图谱检索带偏。",
     )
     parser.add_argument(
         "--top-k",
@@ -155,8 +187,19 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--system-prompt",
-        default=ANSWER_SYSTEM_PROMPT,
+        default=STRICT_ANSWER_SYSTEM_PROMPT,
         help="问答阶段 system prompt。",
+    )
+    parser.add_argument(
+        "--strict-answer",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="先获取 LightRAG 原始检索提示，再用抽取式 prompt 生成答案。",
+    )
+    parser.add_argument(
+        "--dump-prompt",
+        action="store_true",
+        help="打印 LightRAG 生成的原始检索提示，用于排查模型是否拿到了正确原文。",
     )
     return parser.parse_args()
 

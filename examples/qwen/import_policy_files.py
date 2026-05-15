@@ -14,11 +14,25 @@ from qwen_policy_common import (
     DEFAULT_WORKING_DIR,
     build_qwen_policy_rag,
     describe_storage_backends,
+    insert_retrieval_only_chunks,
     normalize_storage,
     resolve_input_paths,
 )
 
 from raganything.utils import insert_text_content
+from policy_structure import build_structured_chunks, write_structured_chunks_sidecar
+
+
+def detect_cuda_status() -> tuple[bool | None, str | None]:
+    """Best-effort CUDA availability probe for user-facing import hints."""
+    try:
+        import torch
+
+        available = bool(torch.cuda.is_available())
+        device_name = torch.cuda.get_device_name(0) if available else None
+        return available, device_name
+    except Exception:
+        return None, None
 
 
 def content_item_to_text(item: dict, index: int) -> dict | None:
@@ -150,7 +164,34 @@ async def import_files(args: argparse.Namespace) -> None:
         print(f"本地索引目录: {Path(args.working_dir).resolve()}")
     print(f"解析输出目录: {Path(args.output_dir).resolve()}")
     print(f"解析器: {args.parser}, 解析模式: {args.parse_method}")
+    print(f"MinerU 设备: {args.mineru_device or 'default'}")
+    cuda_available, cuda_device_name = detect_cuda_status()
+    if args.parser == "mineru":
+        requested_device = (args.mineru_device or "").strip().lower()
+        gpu_requested = requested_device.startswith("cuda")
+        if gpu_requested:
+            if cuda_available is False:
+                print(
+                    "提示: 当前命令显式指定了 `--mineru-device cuda`，但本机未检测到可用 CUDA。"
+                    " MinerU 可能无法使用 GPU。"
+                )
+            elif cuda_available and cuda_device_name:
+                print(f"提示: 已请求 GPU 解析，检测到 CUDA 设备: {cuda_device_name}")
+        else:
+            if cuda_available and cuda_device_name:
+                print(
+                    "提示: 当前命令没有显式使用 GPU。检测到可用 CUDA 设备: "
+                    f"{cuda_device_name}。扫描件建议传 `--mineru-device cuda`。"
+                )
+            elif cuda_available is False:
+                print("提示: 当前未检测到可用 CUDA，MinerU 将不会使用 GPU。")
+            else:
+                print(
+                    "提示: 当前未显式指定 GPU，且无法确认 CUDA 状态。"
+                    " 如需强制走 GPU，可传 `--mineru-device cuda`。"
+                )
     print(f"索引模式: {args.index_mode}")
+    print(f"QA 策略: {'structured_retrieval_first' if args.retrieval_only else 'default_lightrag'}")
     print(f"存储后端: {describe_storage_backends(storage)}")
     print(f"待导入文件数: {len(files)}")
 
@@ -164,6 +205,8 @@ async def import_files(args: argparse.Namespace) -> None:
                 "lang": args.ocr_lang,
                 "timeout": args.mineru_timeout,
             }
+            if args.mineru_device:
+                parser_kwargs["device"] = args.mineru_device
             if args.model_source:
                 parser_kwargs["source"] = args.model_source
                 parser_kwargs["env"] = {
@@ -196,18 +239,58 @@ async def import_files(args: argparse.Namespace) -> None:
                 if not text_content_list:
                     raise RuntimeError(f"解析成功但没有可入库的文本内容: {file_path}")
 
-                text_content = "\n\n".join(
-                    item["text"] for item in text_content_list if item.get("text")
-                )
                 text_doc_id = doc_id or make_text_doc_id(file_path, text_content_list)
                 print(f"文本索引模式: doc_id={text_doc_id}")
-                await insert_text_content(
-                    rag.lightrag,
-                    input=text_content,
-                    file_paths=rag._get_file_reference(str(file_path)),
-                    ids=text_doc_id,
-                )
-                await assert_text_insert_succeeded(rag, text_doc_id)
+                if args.chunk_mode == "structured":
+                    structured_chunks = build_structured_chunks(
+                        text_content_list,
+                        doc_id=text_doc_id,
+                        file_name=file_path.name,
+                    )
+                    if not structured_chunks:
+                        raise RuntimeError(f"结构化切分没有生成 chunk: {file_path}")
+                    sidecar = write_structured_chunks_sidecar(
+                        structured_chunks, args.working_dir, text_doc_id
+                    )
+                    print(
+                        f"结构化切分: chunks={len(structured_chunks)}, sidecar={sidecar}"
+                    )
+                    structured_texts = [
+                        chunk.to_index_text() for chunk in structured_chunks
+                    ]
+                    if args.retrieval_only:
+                        await insert_retrieval_only_chunks(
+                            rag,
+                            doc_id=text_doc_id,
+                            source_ref=str(file_path),
+                            chunk_texts=structured_texts,
+                            chunk_ids=[chunk.chunk_id for chunk in structured_chunks],
+                            full_text="\n\n".join(structured_texts),
+                        )
+                        await assert_text_insert_succeeded(rag, text_doc_id)
+                    else:
+                        await insert_text_content(
+                            rag.lightrag,
+                            input=structured_texts,
+                            file_paths=[
+                                rag._get_file_reference(str(file_path))
+                                for _ in structured_chunks
+                            ],
+                            ids=[chunk.chunk_id for chunk in structured_chunks],
+                        )
+                        for chunk in structured_chunks:
+                            await assert_text_insert_succeeded(rag, chunk.chunk_id)
+                else:
+                    text_content = "\n\n".join(
+                        item["text"] for item in text_content_list if item.get("text")
+                    )
+                    await insert_text_content(
+                        rag.lightrag,
+                        input=text_content,
+                        file_paths=rag._get_file_reference(str(file_path)),
+                        ids=text_doc_id,
+                    )
+                    await assert_text_insert_succeeded(rag, text_doc_id)
             print(f"[{index}/{len(files)}] 导入完成: {file_path.name}", flush=True)
     finally:
         await rag.finalize_storages()
@@ -276,12 +359,35 @@ def parse_args() -> argparse.Namespace:
         help="MinerU 单个文件解析超时时间（秒）；默认不限制。",
     )
     parser.add_argument(
+        "--mineru-device",
+        default=os.getenv("MINERU_DEVICE") or os.getenv("QWEN_MINERU_DEVICE"),
+        help="MinerU 推理设备，例如 cpu、cuda、cuda:0、mps。扫描件建议显式传 cuda。",
+    )
+    parser.add_argument(
         "--index-mode",
         default="text",
         choices=["text", "full"],
         help=(
             "索引模式。text=把表格/列表/公式等可文本化内容转成普通文本入库，"
             "避免调用多模态描述；full=启用 RAG-Anything 原生多模态处理。"
+        ),
+    )
+    parser.add_argument(
+        "--chunk-mode",
+        default="auto",
+        choices=["auto", "structured"],
+        help=(
+            "text 索引下的切分方式。auto=沿用 LightRAG 自动 chunk；"
+            "structured=按章/节/条/表格预切分并注入 metadata。"
+        ),
+    )
+    parser.add_argument(
+        "--retrieval-only",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "结构化 chunk 时默认启用检索优先入库：仅写入文本/向量/doc_status，"
+            "不阻塞在实体关系抽取。关闭后回到 LightRAG 默认抽取流程。"
         ),
     )
     parser.add_argument(

@@ -17,6 +17,7 @@ from qwen_policy_common import (
     DEFAULT_WORKING_DIR,
     build_qwen_policy_rag,
     describe_storage_backends,
+    insert_retrieval_only_chunks,
     normalize_storage,
 )
 from import_policy_files import (
@@ -24,6 +25,7 @@ from import_policy_files import (
     normalize_content_list_for_text_index,
 )
 from raganything.utils import insert_text_content
+from policy_structure import build_structured_chunks, write_structured_chunks_sidecar
 
 
 class TableHTMLToText(HTMLParser):
@@ -238,6 +240,7 @@ async def import_parsed_content_lists(args: argparse.Namespace) -> None:
     storage = normalize_storage(args.storage)
     print("Qwen 已解析 content_list 重建索引")
     print(f"工作目录: {Path(args.working_dir).resolve()}")
+    print(f"QA 策略: {'structured_retrieval_first' if args.retrieval_only else 'default_lightrag'}")
     print(f"存储后端: {describe_storage_backends(storage)}")
     print(f"待导入 content_list 数: {len(files)}")
 
@@ -246,12 +249,18 @@ async def import_parsed_content_lists(args: argparse.Namespace) -> None:
             print(f"\n[{index}/{len(files)}] 检查解析结果: {content_list_path}", flush=True)
             data = json.loads(content_list_path.read_text(encoding="utf-8"))
             text_items = content_list_to_text_items(data)
-            text_content = "\n\n".join(item["text"] for item in text_items if item.get("text"))
             doc_id = args.doc_id or make_parsed_doc_id(content_list_path, text_items)
             source_ref = infer_source_reference(content_list_path, args.source_file)
             print(f"dry-run: doc_id={doc_id}")
             print(f"dry-run: source_ref={source_ref}")
-            print(f"dry-run: 文本字符数={len(text_content)}")
+            if args.chunk_mode == "structured":
+                structured_chunks = build_structured_chunks(
+                    text_items, doc_id=doc_id, file_name=Path(source_ref).name
+                )
+                print(f"dry-run: 结构化 chunks={len(structured_chunks)}")
+            else:
+                text_content = "\n\n".join(item["text"] for item in text_items if item.get("text"))
+                print(f"dry-run: 文本字符数={len(text_content)}")
         print("\ndry-run 完成，未写入索引。")
         return
 
@@ -279,19 +288,54 @@ async def import_parsed_content_lists(args: argparse.Namespace) -> None:
             if not text_items:
                 raise RuntimeError(f"content_list 没有可入库文本: {content_list_path}")
 
-            text_content = "\n\n".join(item["text"] for item in text_items if item.get("text"))
             doc_id = args.doc_id or make_parsed_doc_id(content_list_path, text_items)
             source_ref = infer_source_reference(content_list_path, args.source_file)
 
             print(f"解析复用模式: doc_id={doc_id}")
             print(f"解析复用模式: source_ref={source_ref}")
-            await insert_text_content(
-                rag.lightrag,
-                input=text_content,
-                file_paths=source_ref,
-                ids=doc_id,
-            )
-            await assert_text_insert_succeeded(rag, doc_id)
+            if args.chunk_mode == "structured":
+                structured_chunks = build_structured_chunks(
+                    text_items, doc_id=doc_id, file_name=Path(source_ref).name
+                )
+                if not structured_chunks:
+                    raise RuntimeError(f"结构化切分没有生成 chunk: {content_list_path}")
+                sidecar = write_structured_chunks_sidecar(
+                    structured_chunks, args.working_dir, doc_id
+                )
+                print(
+                    f"结构化切分: chunks={len(structured_chunks)}, sidecar={sidecar}"
+                )
+                structured_texts = [
+                    chunk.to_index_text() for chunk in structured_chunks
+                ]
+                if args.retrieval_only:
+                    await insert_retrieval_only_chunks(
+                        rag,
+                        doc_id=doc_id,
+                        source_ref=source_ref,
+                        chunk_texts=structured_texts,
+                        chunk_ids=[chunk.chunk_id for chunk in structured_chunks],
+                        full_text="\n\n".join(structured_texts),
+                    )
+                    await assert_text_insert_succeeded(rag, doc_id)
+                else:
+                    await insert_text_content(
+                        rag.lightrag,
+                        input=structured_texts,
+                        file_paths=[source_ref for _ in structured_chunks],
+                        ids=[chunk.chunk_id for chunk in structured_chunks],
+                    )
+                    for chunk in structured_chunks:
+                        await assert_text_insert_succeeded(rag, chunk.chunk_id)
+            else:
+                text_content = "\n\n".join(item["text"] for item in text_items if item.get("text"))
+                await insert_text_content(
+                    rag.lightrag,
+                    input=text_content,
+                    file_paths=source_ref,
+                    ids=doc_id,
+                )
+                await assert_text_insert_succeeded(rag, doc_id)
             print(f"[{index}/{len(files)}] 导入完成: {content_list_path.name}", flush=True)
     finally:
         await rag.finalize_storages()
@@ -341,6 +385,24 @@ def parse_args() -> argparse.Namespace:
         "--dry-run",
         action="store_true",
         help="只解析 content_list 并打印统计，不写入索引。",
+    )
+    parser.add_argument(
+        "--chunk-mode",
+        default="auto",
+        choices=["auto", "structured"],
+        help=(
+            "切分方式。auto=沿用 LightRAG 自动 chunk；"
+            "structured=按章/节/条/表格预切分并注入 metadata。"
+        ),
+    )
+    parser.add_argument(
+        "--retrieval-only",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "结构化 chunk 时默认启用检索优先入库：仅写入文本/向量/doc_status，"
+            "不阻塞在实体关系抽取。关闭后回到 LightRAG 默认抽取流程。"
+        ),
     )
     return parser.parse_args()
 

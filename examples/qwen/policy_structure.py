@@ -1,0 +1,204 @@
+#!/usr/bin/env python
+"""Structure Chinese policy text into article/table chunks with metadata."""
+
+from __future__ import annotations
+
+import json
+import re
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any
+
+
+HEADING_NUM = r"[一二三四五六七八九十百千万零〇\d]+"
+CHAPTER_RE = re.compile(rf"^(第{HEADING_NUM}章)\s*(.+)$")
+SECTION_RE = re.compile(rf"^(第{HEADING_NUM}节)\s*(.+)$")
+ARTICLE_RE = re.compile(rf"^(第{HEADING_NUM}条)\s*(.*)$")
+TABLE_RE = re.compile(r"^\[表格[，,]\s*第\s*(\d+)\s*页[，,]\s*块\s*(\d+)\]")
+PAGE_RE = re.compile(r"第\s*(\d+)\s*页")
+
+
+@dataclass
+class StructuredChunk:
+    doc_id: str
+    chunk_id: str
+    chunk_order_index: int
+    file_name: str
+    page_idx: int | None
+    chapter_title: str | None
+    section_title: str | None
+    article_no: str | None
+    content_type: str
+    content: str
+    source_block_range: list[int]
+
+    @property
+    def section_path(self) -> str:
+        return " / ".join(
+            part for part in [self.chapter_title, self.section_title] if part
+        )
+
+    def to_index_text(self) -> str:
+        metadata_lines = [
+            f"文件：{self.file_name}",
+            f"chunk_id：{self.chunk_id}",
+            f"chunk_order_index：{self.chunk_order_index}",
+            f"内容类型：{self.content_type}",
+        ]
+        if self.page_idx is not None:
+            metadata_lines.append(f"页码：{self.page_idx + 1}")
+        if self.section_path:
+            metadata_lines.append(f"章节路径：{self.section_path}")
+        if self.article_no:
+            metadata_lines.append(f"条款：{self.article_no}")
+        return "\n".join(metadata_lines) + "\n正文：\n" + self.content.strip()
+
+    def to_json(self) -> dict[str, Any]:
+        data = asdict(self)
+        data["section_path"] = self.section_path
+        data["index_text"] = self.to_index_text()
+        return data
+
+
+def normalize_ws(text: str) -> str:
+    text = str(text or "").replace("\u3000", " ")
+    text = re.sub(r"[ \t\r\f\v]+", " ", text)
+    text = re.sub(r" *\n+ *", "\n", text)
+    return text.strip()
+
+
+def split_paragraphs(text: str) -> list[str]:
+    text = normalize_ws(text)
+    if not text:
+        return []
+    return [part.strip() for part in re.split(r"\n{2,}", text) if part.strip()]
+
+
+def page_from_text(text: str, fallback: int | None) -> int | None:
+    table_match = TABLE_RE.search(text)
+    if table_match:
+        return int(table_match.group(1)) - 1
+    page_match = PAGE_RE.search(text)
+    if page_match:
+        return int(page_match.group(1)) - 1
+    return fallback
+
+
+def build_structured_chunks(
+    text_items: list[dict[str, Any]], *, doc_id: str, file_name: str
+) -> list[StructuredChunk]:
+    chunks: list[StructuredChunk] = []
+    chapter_title: str | None = None
+    section_title: str | None = None
+    current_article_no: str | None = None
+    current_parts: list[str] = []
+    current_page_idx: int | None = None
+    current_start_block: int | None = None
+
+    def flush_article(end_block: int) -> None:
+        nonlocal current_article_no, current_parts, current_page_idx, current_start_block
+        content = normalize_ws("\n\n".join(current_parts))
+        if not content:
+            current_article_no = None
+            current_parts = []
+            current_page_idx = None
+            current_start_block = None
+            return
+        order = len(chunks)
+        chunks.append(
+            StructuredChunk(
+                doc_id=doc_id,
+                chunk_id=f"{doc_id}-chunk-{order:04d}",
+                chunk_order_index=order,
+                file_name=file_name,
+                page_idx=current_page_idx,
+                chapter_title=chapter_title,
+                section_title=section_title,
+                article_no=current_article_no,
+                content_type="article" if current_article_no else "section_text",
+                content=content,
+                source_block_range=[current_start_block or end_block, end_block],
+            )
+        )
+        current_article_no = None
+        current_parts = []
+        current_page_idx = None
+        current_start_block = None
+
+    def add_table(paragraph: str, page_idx: int | None, block_index: int) -> None:
+        order = len(chunks)
+        chunks.append(
+            StructuredChunk(
+                doc_id=doc_id,
+                chunk_id=f"{doc_id}-chunk-{order:04d}",
+                chunk_order_index=order,
+                file_name=file_name,
+                page_idx=page_idx,
+                chapter_title=chapter_title,
+                section_title=section_title,
+                article_no=current_article_no,
+                content_type="table",
+                content=paragraph,
+                source_block_range=[block_index, block_index],
+            )
+        )
+
+    for block_index, item in enumerate(text_items):
+        if not isinstance(item, dict):
+            continue
+        item_page_idx = item.get("page_idx")
+        if not isinstance(item_page_idx, int):
+            item_page_idx = None
+        for paragraph in split_paragraphs(str(item.get("text") or "")):
+            paragraph_page_idx = page_from_text(paragraph, item_page_idx)
+            chapter_match = CHAPTER_RE.match(paragraph)
+            if chapter_match:
+                flush_article(block_index)
+                chapter_title = normalize_ws(paragraph)
+                section_title = None
+                continue
+
+            section_match = SECTION_RE.match(paragraph)
+            if section_match:
+                flush_article(block_index)
+                section_title = normalize_ws(paragraph)
+                continue
+
+            article_match = ARTICLE_RE.match(paragraph)
+            if article_match:
+                flush_article(block_index)
+                current_article_no = article_match.group(1)
+                current_parts = [paragraph]
+                current_page_idx = paragraph_page_idx
+                current_start_block = block_index
+                continue
+
+            if TABLE_RE.match(paragraph):
+                flush_article(block_index)
+                add_table(paragraph, paragraph_page_idx, block_index)
+                continue
+
+            if current_parts:
+                current_parts.append(paragraph)
+                if current_page_idx is None:
+                    current_page_idx = paragraph_page_idx
+            else:
+                current_article_no = None
+                current_parts = [paragraph]
+                current_page_idx = paragraph_page_idx
+                current_start_block = block_index
+
+    flush_article(len(text_items) - 1)
+    return chunks
+
+
+def write_structured_chunks_sidecar(
+    chunks: list[StructuredChunk], output_dir: str | Path, doc_id: str
+) -> Path:
+    output_path = Path(output_dir) / "structured_chunks" / f"{doc_id}.json"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(
+        json.dumps([chunk.to_json() for chunk in chunks], ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return output_path
