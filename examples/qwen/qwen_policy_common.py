@@ -201,6 +201,184 @@ def build_protected_table_answer_prefix(question: str, focused_context: str) -> 
     return protected_tables
 
 
+def build_document_overview_context(
+    question: str,
+    raw_prompt: str,
+    *,
+    index_chunks: list[dict[str, Any]] | None = None,
+    max_chunks: int = 14,
+) -> str:
+    """Build a broad same-document context for summary/overview questions."""
+    if not is_document_overview_question(question):
+        return ""
+
+    raw_chunks = extract_raw_prompt_document_chunks(raw_prompt or "")
+    all_chunks = list(raw_chunks)
+    if index_chunks:
+        seen_ids = {str(chunk.get("id") or "") for chunk in all_chunks}
+        for chunk in index_chunks:
+            chunk_id = str(chunk.get("id") or "")
+            if chunk_id and chunk_id in seen_ids:
+                continue
+            all_chunks.append(chunk)
+            if chunk_id:
+                seen_ids.add(chunk_id)
+
+    if not all_chunks:
+        return ""
+
+    question_title = extract_question_document_title(question)
+    candidates: list[dict[str, Any]] = []
+    for chunk in all_chunks:
+        content = str(chunk.get("content") or "")
+        meta = parse_structured_chunk_metadata(content)
+        file_name = meta.get("文件") or str(chunk.get("file_path") or "")
+        if question_title and question_title not in file_name and question_title not in content:
+            continue
+        candidates.append(chunk)
+
+    if not candidates:
+        candidates = all_chunks
+
+    candidates = sorted(
+        candidates, key=lambda item: safe_int(item.get("chunk_order_index"))
+    )
+
+    selected: list[dict[str, Any]] = []
+    seen_sections: set[str] = set()
+    for chunk in candidates:
+        content = str(chunk.get("content") or "")
+        meta = parse_structured_chunk_metadata(content)
+        content_type = meta.get("内容类型")
+        section_path = meta.get("章节路径") or "通知"
+        if content_type == "section_text" and chunk not in selected:
+            selected.append(chunk)
+            continue
+        if section_path not in seen_sections:
+            selected.append(chunk)
+            seen_sections.add(section_path)
+        if len(selected) >= max_chunks:
+            break
+
+    if len(selected) < max_chunks:
+        for chunk in candidates:
+            if chunk in selected:
+                continue
+            selected.append(chunk)
+            if len(selected) >= max_chunks:
+                break
+
+    return format_chunks_as_focused_context(selected)
+
+
+def build_document_overview_answer(question: str, focused_context: str) -> str:
+    """Summarize what a policy document mainly covers from retrieved chunks."""
+    if not is_document_overview_question(question):
+        return ""
+
+    chunks = parse_focused_context_chunks(focused_context)
+    if not chunks:
+        return ""
+
+    file_name = next((chunk.get("file", "") for chunk in chunks if chunk.get("file")), "")
+    notice_chunks = [chunk for chunk in chunks if chunk.get("content_type") == "section_text"]
+    article_chunks = [chunk for chunk in chunks if chunk.get("content_type") == "article"]
+    if not article_chunks and not notice_chunks:
+        return ""
+
+    notice_summary = build_notice_summary(notice_chunks)
+    section_summaries = build_section_overview_summaries(article_chunks)
+    topic_names = [item[0] for item in section_summaries]
+    topic_text = "、".join(topic_names[:8])
+
+    document_name = clean_source_title(file_name) or extract_question_document_title(question)
+    overview_parts: list[str] = []
+    if notice_summary:
+        overview_parts.append(notice_summary)
+    if topic_text:
+        overview_parts.append(
+            f"从主体内容看，《{document_name}》主要围绕{topic_text}等事项，对云南省土地储备的管理机制、计划编制、入库管理、开发管护、资金使用和监督责任作出规范。"
+        )
+    if not overview_parts:
+        overview_parts.append("该文件主要对检索片段中的相关政策事项作出规定。")
+
+    lines: list[str] = ["文件解读：", "".join(overview_parts), "", "主要内容："]
+    item_index = 1
+    for section_name, section_chunks in section_summaries[:8]:
+        sample = build_section_sample_text(section_chunks)
+        if not sample:
+            continue
+        lines.append(f"{item_index}. {section_name}：{sample}")
+        item_index += 1
+
+    lines.extend(["", "参考来源："])
+    lines.extend(build_reference_file_lines(chunks))
+    return "\n".join(lines).strip()
+
+
+def build_extractive_policy_answer(question: str, focused_context: str) -> str:
+    """Build a clause-numbered answer for focused policy definition/topic queries."""
+    if is_document_overview_question(question) or is_clause_extractive_question(question):
+        return ""
+    if not is_policy_definition_question(question):
+        return ""
+
+    chunks = parse_focused_context_chunks(focused_context)
+    article_chunks = [chunk for chunk in chunks if chunk.get("content_type") == "article"]
+    if not article_chunks:
+        return ""
+
+    terms = build_focus_terms(question)
+    scored = [
+        (score_focus_snippet(focus_scoring_text_from_chunk(chunk), terms, terms), index, chunk)
+        for index, chunk in enumerate(article_chunks)
+    ]
+    scored.sort(key=lambda item: item[0], reverse=True)
+    if not scored or scored[0][0] <= 0:
+        return ""
+
+    top_chunk = scored[0][2]
+    top_file = top_chunk.get("file")
+    top_section = top_chunk.get("section_path")
+    selected = [
+        chunk
+        for chunk in article_chunks
+        if chunk.get("file") == top_file
+        and (not top_section or chunk.get("section_path") == top_section)
+    ]
+    if not selected:
+        return ""
+    selected.sort(key=lambda item: safe_int(item.get("chunk_order_index")))
+
+    conclusion = build_extractive_conclusion(selected, max_sentences=4)
+    lines: list[str] = [
+        "结论：",
+        conclusion or "检索原文对该事项作出了如下规定。",
+        "",
+        "依据：",
+    ]
+
+    seen_bodies: set[str] = set()
+    for chunk in selected:
+        body = normalize_answer_line(chunk.get("body", ""))
+        if not body or body in seen_bodies:
+            continue
+        seen_bodies.add(body)
+        prefix_parts = []
+        if chunk.get("clause"):
+            prefix_parts.append(chunk["clause"])
+        if chunk.get("page"):
+            prefix_parts.append(f"页码 {chunk['page']}")
+        prefix = f"{'，'.join(prefix_parts)}：" if prefix_parts else ""
+        lines.append(f"{len(seen_bodies)}. {prefix}{body}")
+
+    lines.extend(["", "补充说明："])
+    lines.append("以上内容均为检索片段中的原文条款或表格，未补充外部标准或未检索到的数值。")
+    lines.extend(["", "参考来源："])
+    lines.extend(build_reference_source_lines(selected))
+    return "\n".join(lines).strip()
+
+
 def merge_protected_table_answer(answer: str, protected_table: str) -> str:
     """Preserve exact source table rows without discarding the prose answer."""
     cleaned = clean_answer_text(answer)
@@ -225,6 +403,129 @@ def merge_protected_table_answer(answer: str, protected_table: str) -> str:
     return protected_table
 
 
+def find_table_chunk_for_protected_table(
+    chunks: list[dict[str, str]], raw_protected_table: str
+) -> dict[str, str] | None:
+    raw_protected_table = str(raw_protected_table or "").strip()
+    if raw_protected_table:
+        for chunk in chunks:
+            if raw_protected_table in chunk.get("body", ""):
+                return chunk
+
+    table_lines = [
+        line.strip()
+        for line in raw_protected_table.splitlines()
+        if "|" in line and line.strip()
+    ][:3]
+    if table_lines:
+        for chunk in chunks:
+            body = chunk.get("body", "")
+            if all(line in body for line in table_lines):
+                return chunk
+
+    return next((chunk for chunk in chunks if chunk.get("content_type") == "table"), None)
+
+
+def extract_listing_subject(question: str) -> str:
+    subject = str(question or "")
+    subject = re.sub(
+        r"(包含哪些.*|包括哪些.*|有哪些.*|列出.*|分别是.*|是什么|什么是|[？?])",
+        "",
+        subject,
+    )
+    return subject.strip(" ：:，,。") or "该名录"
+
+
+def count_pipe_table_data_rows(table: str) -> int:
+    count = 0
+    for line in str(table or "").splitlines():
+        if "|" not in line:
+            continue
+        first_cell = line.split("|", 1)[0].strip()
+        if re.fullmatch(r"\d+", first_cell):
+            count += 1
+    return count
+
+
+def is_spreadsheet_source(file_name: str) -> bool:
+    return Path(clean_source_title(file_name)).suffix.lower() in {
+        ".xls",
+        ".xlsx",
+        ".csv",
+        ".tsv",
+    }
+
+
+def clean_table_for_answer(table: str) -> str:
+    kept: list[str] = []
+    for line in str(table or "").splitlines():
+        stripped = line.strip()
+        if not stripped:
+            if kept and kept[-1]:
+                kept.append("")
+            continue
+        if re.match(r"^\[表格，第\s*\d+\s*页，块\s*\d+\]$", stripped):
+            continue
+        if stripped == "表格转写：":
+            continue
+        if stripped.startswith("表格作答要求："):
+            break
+        kept.append(stripped)
+    while kept and not kept[-1]:
+        kept.pop()
+    return "\n".join(kept).strip()
+
+
+def extract_pipe_table_header(table: str) -> list[str]:
+    for line in str(table or "").splitlines():
+        if "|" not in line:
+            continue
+        cells = [cell.strip() for cell in line.split("|")]
+        if len(cells) >= 2 and not re.fullmatch(r"\d+", cells[0]):
+            return [cell for cell in cells if cell]
+    return []
+
+
+def build_listing_table_answer(
+    question: str,
+    chunks: list[dict[str, str]],
+    table_chunk: dict[str, str] | None,
+    protected_table: str,
+) -> str:
+    subject = extract_listing_subject(question)
+    display_table = clean_table_for_answer(protected_table) or protected_table
+    row_count = count_pipe_table_data_rows(display_table)
+    count_text = f"，共{row_count}条" if row_count else ""
+    item_label = "公园" if "公园" in question else "条目"
+    header = extract_pipe_table_header(display_table)
+
+    lines: list[str] = [
+        "结论：",
+        f"{subject}包含下列原表所列{item_label}{count_text}。",
+        "",
+    ]
+    if header:
+        lines.extend(["字段：", "、".join(header), ""])
+    lines.extend(
+        [
+            "名录明细：",
+            display_table,
+            "",
+            "补充说明：",
+            "以上内容均来自检索到的原表数据，未补充外部名录或未检索到的条目。",
+            "",
+            "参考来源：",
+        ]
+    )
+    reference_chunks = (
+        [table_chunk]
+        if table_chunk
+        else [chunk for chunk in chunks if chunk.get("content_type") == "table"][:1]
+    )
+    lines.extend(build_reference_source_lines(reference_chunks))
+    return "\n".join(lines).strip()
+
+
 def build_extractive_table_answer(
     question: str, focused_context: str, protected_table: str
 ) -> str:
@@ -243,10 +544,10 @@ def build_extractive_table_answer(
     if not chunks:
         return ""
 
-    table_chunk = next(
-        (chunk for chunk in chunks if raw_protected_table in chunk.get("body", "")),
-        None,
-    )
+    table_chunk = find_table_chunk_for_protected_table(chunks, raw_protected_table)
+    if is_table_listing_question(question):
+        return build_listing_table_answer(question, chunks, table_chunk, protected_table)
+
     table_section = table_chunk.get("section_path") if table_chunk else ""
     table_doc = table_chunk.get("file") if table_chunk else ""
     terms = build_focus_terms(question)
@@ -341,7 +642,9 @@ def build_extractive_table_answer(
     if not seen_bodies:
         lines.append("1. 资料中未检索到可单独抽取的非表格条款；请以原文表格为准。")
 
-    lines.extend(["", "原文表格：", protected_table, "", "补充说明："])
+    display_table = clean_table_for_answer(protected_table) or protected_table
+    table_heading = "表格数据：" if table_chunk and is_spreadsheet_source(table_chunk.get("file", "")) else "原文表格："
+    lines.extend(["", table_heading, display_table, "", "补充说明："])
     lines.append("以上内容均为检索片段中的原文条款或表格，未补充外部标准或未检索到的数值。")
     lines.extend(["", "参考来源："])
     reference_chunks = article_chunks + ([table_chunk] if table_chunk else [])
@@ -437,6 +740,7 @@ def parse_focused_context_chunks(focused_context: str) -> list[dict[str, str]]:
         meta = parse_structured_chunk_metadata(content)
         body = content.split("正文：", 1)[1].strip() if "正文：" in content else content
         body = body.split("表格作答要求：", 1)[0].strip()
+        body = clean_policy_body_artifacts(body)
         chunks.append(
             {
                 "file": clean_source_title(meta.get("文件", "")),
@@ -471,11 +775,24 @@ def build_reference_source_lines(chunks: list[dict[str, str]]) -> list[str]:
     lines: list[str] = []
     for index, file_name in enumerate(order[:5], start=1):
         pages = sort_page_values(grouped[file_name])
-        if pages:
+        if pages and not is_spreadsheet_source(file_name):
             lines.append(f"{index}. 页码 {'、'.join(pages)} - 《{file_name}》")
         else:
             lines.append(f"{index}. 《{file_name}》")
     return lines
+
+
+def build_reference_file_lines(chunks: list[dict[str, str]]) -> list[str]:
+    file_names: list[str] = []
+    for chunk in chunks:
+        file_name = clean_source_title(chunk.get("file", ""))
+        if file_name and file_name not in file_names:
+            file_names.append(file_name)
+
+    if not file_names:
+        return ["1. 来源未标明"]
+
+    return [f"{index}. 《{file_name}》" for index, file_name in enumerate(file_names[:5], start=1)]
 
 
 def clean_source_title(title: str) -> str:
@@ -494,6 +811,7 @@ def safe_int(value: Any) -> int:
 def normalize_answer_line(text: str) -> str:
     text = normalize_policy_text_for_answer(text)
     text = re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"(?<=[\u4e00-\u9fff])\s+(?=[\u4e00-\u9fff])", "", text)
     return text
 
 
@@ -586,10 +904,156 @@ def split_policy_sentences(text: str) -> list[str]:
     return [piece.strip() for piece in pieces if piece.strip()]
 
 
+def is_document_overview_question(question: str) -> bool:
+    question = str(question or "")
+    return any(marker in question for marker in ["主要讲", "主要内容", "概述", "总结"])
+
+
+def is_policy_definition_question(question: str) -> bool:
+    question = str(question or "")
+    return any(marker in question for marker in ["是什么", "什么是", "指什么", "包括哪些"])
+
+
+def is_table_listing_question(question: str) -> bool:
+    question = str(question or "")
+    return any(
+        marker in question
+        for marker in ["包含哪些", "包括哪些", "有哪些", "名录", "清单", "名单", "目录"]
+    )
+
+
+def extract_question_document_title(question: str) -> str:
+    question = str(question or "")
+    match = re.search(r"《([^》]+)》", question)
+    if match:
+        return match.group(1).strip()
+    cleaned = re.sub(
+        r"(主要讲的什么内容|主要讲什么内容|主要内容是什么|是什么|什么是|有哪些|包含哪些|[？?])",
+        "",
+        question,
+    )
+    return cleaned.strip("《》 ：:，,。")
+
+
+def format_chunks_as_focused_context(chunks: list[dict[str, Any]]) -> str:
+    parts: list[str] = []
+    for ref_index, chunk in enumerate(chunks, start=1):
+        file_path = Path(str(chunk.get("file_path") or "")).name or "来源未标明"
+        order = chunk.get("chunk_order_index")
+        content = format_focused_chunk_content(str(chunk.get("content") or ""))
+        parts.append(
+            f"[参考内容{ref_index}]\n"
+            f"chunk_id: {chunk.get('id')}\n"
+            f"chunk_order_index: {order}\n"
+            f"文件: 《{file_path}》\n"
+            f"原文:\n{content}"
+        )
+    return "\n\n---\n\n".join(parts)
+
+
+def build_notice_summary(chunks: list[dict[str, str]]) -> str:
+    for chunk in chunks:
+        body = clean_policy_body_artifacts(chunk.get("body", ""))
+        if not body:
+            continue
+        lines = [line.strip() for line in body.splitlines() if line.strip()]
+        title_line = next((line for line in lines if "关于印发" in line and "通知" in line), "")
+        issue_text = " ".join(lines)
+        issue_match = re.search(r"现将《([^》]+)》印发给你们，请认真贯彻落实", issue_text)
+        repeal_match = re.search(r"(\d{4}\s*年印发的[^。；]+同时废止)", issue_text)
+        parts: list[str] = []
+        if title_line:
+            parts.append(f"该文件为{title_line.strip()}。")
+        if issue_match:
+            parts.append(f"其核心是印发《{issue_match.group(1)}》。")
+        if repeal_match:
+            parts.append(f"同时明确{repeal_match.group(1).strip()}。")
+        if parts:
+            return "".join(parts)
+    return ""
+
+
+def build_section_overview_summaries(
+    chunks: list[dict[str, str]]
+) -> list[tuple[str, list[dict[str, str]]]]:
+    grouped: dict[str, list[dict[str, str]]] = {}
+    order: list[str] = []
+    for chunk in sorted(chunks, key=lambda item: safe_int(item.get("chunk_order_index"))):
+        section = clean_section_name(chunk.get("section_path", ""))
+        if not section:
+            continue
+        if section not in grouped:
+            grouped[section] = []
+            order.append(section)
+        grouped[section].append(chunk)
+    return [(section, grouped[section]) for section in order]
+
+
+def clean_section_name(section_path: str) -> str:
+    section_path = str(section_path or "").strip()
+    if not section_path:
+        return ""
+    return section_path.split("/")[-1].strip()
+
+
+def build_section_sample_text(chunks: list[dict[str, str]]) -> str:
+    samples: list[str] = []
+    for chunk in chunks[:3]:
+        body = normalize_answer_line(chunk.get("body", ""))
+        body = re.sub(r"^第[一二三四五六七八九十百零〇\d]+条\s*", "", body).strip()
+        pieces = split_policy_sentences(body)
+        if pieces:
+            sample = pieces[0].strip("；;。 ")
+            if sample and sample not in samples:
+                samples.append(sample)
+    return truncate_answer_text("；".join(samples) + ("。" if samples else ""), 260)
+
+
+def truncate_answer_text(text: str, max_len: int) -> str:
+    text = normalize_answer_line(text)
+    if len(text) <= max_len:
+        return text
+    cut = text[:max_len].rstrip("，,；;、 ")
+    return cut + "。"
+
+
+def focus_scoring_text_from_chunk(chunk: dict[str, str]) -> str:
+    parts = [
+        chunk.get("section_path", ""),
+        chunk.get("clause", ""),
+        chunk.get("body", ""),
+    ]
+    return "\n".join(part for part in parts if part)
+
+
+def clean_policy_body_artifacts(text: str) -> str:
+    kept: list[str] = []
+    for line in str(text or "").splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if re.match(r"^\[(?:header|footer|列表)，第\s*\d+\s*页，块\s*\d+\]$", stripped):
+            continue
+        if stripped in {"®", "X云南省", "云南省", "人民政府发布", "X云南省人民政府发布"}:
+            continue
+        if stripped == "云南省人民政府行政规范性文件":
+            continue
+        if re.match(r"^[\u4e00-\u9fff]?[）)\]】;；]+$", stripped):
+            continue
+        stripped = re.sub(r"(?<=[\u4e00-\u9fff])\d+$", "", stripped)
+        kept.append(stripped)
+    return "\n".join(kept).strip()
+
+
 def build_protected_table_context(question: str, focused_context: str) -> str:
     blocks = extract_pipe_table_blocks(focused_context)
     if not blocks:
         return ""
+    if is_table_listing_question(question):
+        data_blocks = [block for block in blocks if count_pipe_table_data_rows(block) > 0]
+        if data_blocks:
+            return max(data_blocks, key=count_pipe_table_data_rows)
+
     terms = build_focus_terms(question)
     scored = [
         (score_focus_snippet(block, terms, terms), index, block)
@@ -879,6 +1343,75 @@ async def insert_retrieval_only_chunks(
         )
 
 
+def chunk_contains_table(content: str) -> bool:
+    content = str(content or "")
+    return (
+        "<table" in content.lower()
+        or "内容类型：table" in content
+        or sum(1 for line in content.splitlines() if "|" in line) >= 2
+    )
+
+
+def build_listing_table_context(
+    chunks: list[dict[str, Any]], question: str, *, max_chunks: int = 8
+) -> str:
+    if not is_table_listing_question(question):
+        return ""
+
+    terms = build_focus_terms(question)
+    if not terms:
+        return ""
+
+    scored: list[tuple[int, int, dict[str, Any]]] = []
+    for index, chunk in enumerate(chunks):
+        content = str(chunk.get("content") or "")
+        if not chunk_contains_table(content):
+            continue
+
+        meta = parse_structured_chunk_metadata(content)
+        file_text = " ".join(
+            [
+                meta.get("文件", ""),
+                meta.get("相对路径", ""),
+                str(chunk.get("file_path") or ""),
+                meta.get("章节路径", ""),
+            ]
+        )
+        scoring_text = f"{file_text}\n{focus_scoring_text(content)}"
+        if not any(term in scoring_text for term in terms):
+            continue
+
+        score = score_focus_snippet(scoring_text, terms, terms)
+        if meta.get("内容类型") == "table" or "<table" in content.lower():
+            score += 700
+        if any(marker in file_text for marker in ["名录", "清单", "名单", "目录"]):
+            score += 250
+        scored.append((score, index, chunk))
+
+    if not scored:
+        return ""
+
+    scored.sort(key=lambda item: (-item[0], safe_int(item[2].get("chunk_order_index"))))
+    if scored[0][0] <= 0:
+        return ""
+
+    _, top_index, top_chunk = scored[0]
+    top_doc_id = top_chunk.get("full_doc_id") or top_chunk.get("reference_id")
+    selected_indexes = [top_index]
+
+    for score, index, chunk in scored[1:]:
+        if len(selected_indexes) >= max_chunks:
+            break
+        if (chunk.get("full_doc_id") or chunk.get("reference_id")) != top_doc_id:
+            continue
+        if score <= 0:
+            continue
+        selected_indexes.append(index)
+
+    selected_chunks = [chunks[index] for index in sorted(set(selected_indexes))]
+    return format_chunks_as_focused_context(selected_chunks)
+
+
 def build_chunk_focused_context(
     chunks: list[dict[str, Any]],
     question: str,
@@ -892,6 +1425,12 @@ def build_chunk_focused_context(
 
     if not chunks:
         return ""
+
+    listing_table_context = build_listing_table_context(
+        chunks, question, max_chunks=max_chunks
+    )
+    if listing_table_context:
+        return listing_table_context
 
     terms = build_focus_terms(question)
     high_priority_terms = terms

@@ -16,7 +16,10 @@ from qwen_policy_common import (
     DEFAULT_WORKING_DIR,
     STRICT_ANSWER_SYSTEM_PROMPT,
     build_chunk_focused_context,
+    build_document_overview_answer,
+    build_document_overview_context,
     build_extractive_clause_answer,
+    build_extractive_policy_answer,
     build_extractive_table_answer,
     build_protected_table_answer_prefix,
     build_strict_answer_prompt,
@@ -174,6 +177,17 @@ async def query(args: argparse.Namespace) -> None:
                     question,
                     raw_prompt=raw_prompt,
                 )
+                overview_context = build_document_overview_context(question, raw_prompt)
+                if overview_context:
+                    if not index_chunks:
+                        index_chunks = await load_index_chunks(args.working_dir, storage)
+                    overview_context = build_document_overview_context(
+                        question,
+                        raw_prompt,
+                        index_chunks=index_chunks,
+                    )
+                if overview_context:
+                    focused_context = overview_context
                 if not focused_context:
                     index_chunks = await load_index_chunks(args.working_dir, storage)
                     focused_context = build_chunk_focused_context(index_chunks, question)
@@ -194,7 +208,11 @@ async def query(args: argparse.Namespace) -> None:
                         question, focused_context, protected_table_prefix
                     ) or merge_protected_table_answer(str(answer), protected_table_prefix)
                 else:
-                    answer = build_extractive_clause_answer(
+                    answer = build_document_overview_answer(
+                        question, focused_context
+                    ) or build_extractive_policy_answer(
+                        question, focused_context
+                    ) or build_extractive_clause_answer(
                         question, focused_context
                     ) or clean_answer_text(str(answer))
             else:
