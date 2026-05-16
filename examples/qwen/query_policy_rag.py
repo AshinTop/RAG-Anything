@@ -13,7 +13,6 @@ from pathlib import Path
 
 from qwen_policy_common import (
     ANSWER_SYSTEM_PROMPT,
-    DEFAULT_WORKING_DIR,
     STRICT_ANSWER_SYSTEM_PROMPT,
     build_chunk_focused_context,
     build_document_overview_answer,
@@ -25,9 +24,16 @@ from qwen_policy_common import (
     build_strict_answer_prompt,
     build_qwen_policy_rag,
     clean_answer_text,
+    flush_runtime_artifact_records,
     load_index_chunks,
     merge_protected_table_answer,
     normalize_storage,
+    resolve_path_from_save,
+    resolve_working_dir,
+    restore_path_from_save,
+    set_postgres_workspace,
+    sync_file_to_save,
+    sync_tree_to_save,
 )
 from lightrag import QueryParam
 
@@ -36,7 +42,7 @@ DEFAULT_QA_OUTPUT_DIR = str(Path(__file__).resolve().parents[2] / "output" / "qw
 
 
 def local_index_has_chunks(working_dir: Path) -> bool:
-    text_chunks_path = working_dir / "kv_store_text_chunks.json"
+    text_chunks_path = resolve_path_from_save(working_dir / "kv_store_text_chunks.json")
     if text_chunks_path.exists():
         try:
             with text_chunks_path.open("r", encoding="utf-8") as f:
@@ -46,7 +52,7 @@ def local_index_has_chunks(working_dir: Path) -> bool:
         except Exception:
             pass
 
-    vector_chunks_path = working_dir / "vdb_chunks.json"
+    vector_chunks_path = resolve_path_from_save(working_dir / "vdb_chunks.json")
     if vector_chunks_path.exists():
         try:
             with vector_chunks_path.open("r", encoding="utf-8") as f:
@@ -113,12 +119,17 @@ def write_qa_output(
         "",
     ]
     file_path.write_text("\n".join(content), encoding="utf-8")
+    sync_file_to_save(file_path)
     return file_path
 
 
 async def query(args: argparse.Namespace) -> None:
-    working_dir = Path(args.working_dir)
     storage = normalize_storage(args.storage)
+    if storage in {"postgres", "postgres-age"}:
+        set_postgres_workspace(args.workspace)
+    args.working_dir = resolve_working_dir(args.working_dir, storage)
+    restore_path_from_save(args.working_dir)
+    working_dir = Path(args.working_dir)
     if storage == "local" and not working_dir.exists():
         raise FileNotFoundError(f"索引目录不存在，请先运行导入脚本: {working_dir}")
     if storage == "local" and not local_index_has_chunks(working_dir):
@@ -241,6 +252,9 @@ async def query(args: argparse.Namespace) -> None:
                 print(f"\nQA 结果已保存: {output_file}")
     finally:
         await rag.finalize_storages()
+        sync_tree_to_save(args.working_dir)
+        sync_tree_to_save(args.qa_output_dir)
+        await flush_runtime_artifact_records()
 
 
 def parse_args() -> argparse.Namespace:
@@ -257,15 +271,26 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--working-dir",
-        default=DEFAULT_WORKING_DIR,
-        help="RAG 工作目录；local 模式从这里读取索引，postgres 模式用于运行文件。",
+        default=None,
+        help=(
+            "RAG 工作目录。local 模式默认读取本地索引目录；postgres 模式可省略，"
+            "省略时按数据库 workspace 派生为 rag_storage/<workspace>，仅用于运行文件。"
+        ),
+    )
+    parser.add_argument(
+        "--workspace",
+        default=None,
+        help=(
+            "PostgreSQL workspace/知识库名；等价于设置 POSTGRES_WORKSPACE。"
+            "仅 postgres/postgres-age 模式生效。"
+        ),
     )
     parser.add_argument(
         "--storage",
-        default=None,
+        default="postgres",
         choices=["local", "postgres", "pg", "postgresql", "postgres-age", "pg-age"],
         help=(
-            "索引存储后端。local=本地文件；postgres=PostgreSQL KV/向量/状态 + "
+            "索引存储后端，默认 postgres。local=本地文件；postgres=PostgreSQL KV/向量/状态 + "
             "NetworkX 图；postgres-age=全 PostgreSQL，需安装 Apache AGE。"
         ),
     )
@@ -316,8 +341,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--dump-prompt",
-        action="store_true",
-        help="打印 LightRAG 生成的原始检索提示，用于排查模型是否拿到了正确原文。",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="默认打印 LightRAG 生成的原始检索提示；传 --no-dump-prompt 可关闭。",
     )
     parser.add_argument(
         "--save-output",

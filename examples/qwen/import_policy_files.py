@@ -16,9 +16,13 @@ from qwen_policy_common import (
     DEFAULT_WORKING_DIR,
     build_qwen_policy_rag,
     describe_storage_backends,
+    flush_runtime_artifact_records,
     insert_retrieval_only_chunks,
     normalize_storage,
     resolve_input_paths,
+    restore_path_from_save,
+    sync_file_to_save,
+    sync_tree_to_save,
 )
 
 from raganything.utils import insert_text_content
@@ -143,6 +147,7 @@ def write_mineru_failure_report(
         "successes": successes,
     }
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    sync_file_to_save(report_path)
     return report_path
 
 
@@ -393,6 +398,7 @@ async def assert_text_insert_succeeded(rag, doc_id: str) -> None:
 
 
 async def import_files(args: argparse.Namespace) -> None:
+    restore_path_from_save(args.working_dir)
     files = resolve_input_paths(args.files, recursive=args.recursive)
     if not files:
         raise RuntimeError("没有找到可导入的文件。")
@@ -595,6 +601,9 @@ async def import_files(args: argparse.Namespace) -> None:
             print(f"[{index}/{len(files)}] 导入完成: {file_path.name}", flush=True)
     finally:
         await rag.finalize_storages()
+        sync_tree_to_save(args.working_dir)
+        sync_tree_to_save(args.output_dir)
+        await flush_runtime_artifact_records()
 
     print("\n全部文件导入完成。该脚本只创建索引，不执行问答。")
 

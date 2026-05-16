@@ -13,7 +13,13 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from qwen_policy_common import DEFAULT_OUTPUT_DIR, DEFAULT_WORKING_DIR
+from qwen_policy_common import (
+    DEFAULT_OUTPUT_DIR,
+    DEFAULT_WORKING_DIR,
+    restore_file_from_save,
+    sync_file_to_save,
+    sync_tree_to_save,
+)
 
 
 DOCUMENT_EXTENSIONS = {
@@ -52,6 +58,7 @@ def iso_now() -> str:
 
 
 def load_manifest(path: Path) -> dict:
+    path = restore_file_from_save(path)
     if not path.exists():
         return {"files": {}}
     try:
@@ -66,6 +73,7 @@ def load_manifest(path: Path) -> dict:
 def save_manifest(path: Path, manifest: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    sync_file_to_save(path)
 
 
 def file_sha256(path: Path) -> str:
@@ -89,6 +97,10 @@ def get_pdf_page_count(path: Path) -> int | None:
         return len(PdfReader(str(path)).pages)
     except Exception:
         return None
+
+
+def is_office_lock_file(path: Path) -> bool:
+    return path.name.startswith("~$") and path.suffix.lower() in OFFICE_EXTENSIONS
 
 
 def classify_file(path: Path, root: Path, args: argparse.Namespace) -> dict:
@@ -125,6 +137,7 @@ def classify_file(path: Path, root: Path, args: argparse.Namespace) -> dict:
         "is_large_by_size": is_large_by_size,
         "is_large_by_pages": is_large_by_pages,
         "needs_office_convert": suffix in OFFICE_EXTENSIONS,
+        "is_office_lock_file": is_office_lock_file(path),
         "is_presentation": suffix in PRESENTATION_EXTENSIONS,
         "is_gis_asset": suffix in GIS_OR_SYSTEM_EXTENSIONS,
         "import_strategy": "skip",
@@ -132,7 +145,9 @@ def classify_file(path: Path, root: Path, args: argparse.Namespace) -> dict:
         "eligible": False,
     }
 
-    if not suffix:
+    if item["is_office_lock_file"]:
+        item["skip_reason"] = "office_lock_file"
+    elif not suffix:
         item["skip_reason"] = "empty_extension"
     elif suffix in GIS_OR_SYSTEM_EXTENSIONS:
         item["skip_reason"] = "gis_or_system_asset"
@@ -232,6 +247,7 @@ def summarize_items(items: list[dict]) -> dict:
         "large_by_size_files": sum(1 for item in items if item.get("is_large_by_size")),
         "large_by_pages_files": sum(1 for item in items if item.get("is_large_by_pages")),
         "office_files": sum(1 for item in items if item["needs_office_convert"]),
+        "office_lock_files": sum(1 for item in items if item.get("is_office_lock_file")),
         "gis_assets": sum(1 for item in items if item["is_gis_asset"]),
         "by_extension": by_extension,
         "by_directory": by_directory,
@@ -351,6 +367,7 @@ def write_report(path: Path, manifest: dict) -> None:
 
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    sync_file_to_save(path)
 
 
 def source_metadata_for_import(file_item: dict) -> dict:
@@ -372,6 +389,7 @@ def source_metadata_for_import(file_item: dict) -> dict:
         "is_large_by_size",
         "is_large_by_pages",
         "needs_office_convert",
+        "is_office_lock_file",
         "is_presentation",
         "source_paths",
     ]
@@ -494,6 +512,8 @@ def run_batch(args: argparse.Namespace) -> None:
     )
     save_manifest(manifest_path, manifest)
     write_report(report_path, manifest)
+    sync_tree_to_save(args.working_dir)
+    sync_tree_to_save(args.output_dir)
 
     print("Qwen 中文政策文件批量导入")
     print(f"目录: {root}")

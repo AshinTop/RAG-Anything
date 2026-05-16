@@ -9,6 +9,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+from qwen_policy_common import sync_file_to_save
+
 
 HEADING_NUM = r"[一二三四五六七八九十百千万零〇\d]+"
 CHAPTER_RE = re.compile(rf"^(第{HEADING_NUM}章)\s*(.+)$")
@@ -229,4 +231,5 @@ def write_structured_chunks_sidecar(
         json.dumps([chunk.to_json() for chunk in chunks], ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+    sync_file_to_save(output_path)
     return output_path

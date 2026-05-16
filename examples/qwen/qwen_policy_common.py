@@ -10,9 +10,11 @@ import re
 import sys
 import hashlib
 import json
+import mimetypes
 import shutil
 import subprocess
 import time
+import asyncio
 from datetime import datetime
 from datetime import timezone
 from pathlib import Path
@@ -38,8 +40,13 @@ from raganything import RAGAnything, RAGAnythingConfig, set_prompt_language
 
 DEFAULT_WORKING_DIR = str(RAGANYTHING_ROOT / "rag_storage" / "qwen_policy_text")
 DEFAULT_OUTPUT_DIR = str(RAGANYTHING_ROOT / "output" / "qwen_policy_parser")
+DEFAULT_POSTGRES_WORKING_DIR_BASE = RAGANYTHING_ROOT / "rag_storage"
+DEFAULT_SAVE_ROOT = WORKSPACE_ROOT / "save"
 
 _GPU_UNAVAILABLE_REPORTED = False
+_RUNTIME_ARTIFACT_WARNING_REPORTED = False
+_RUNTIME_ARTIFACT_DB_DISABLED = False
+_RUNTIME_ARTIFACT_TASKS: set[asyncio.Task] = set()
 
 LOCAL_STORAGE_BACKENDS = {
     "kv_storage": "JsonKVStorage",
@@ -1190,12 +1197,7 @@ async def load_postgres_chunks() -> list[dict[str, Any]]:
     except ImportError:
         return []
 
-    workspace = (
-        os.getenv("PG_WORKSPACE")
-        or os.getenv("POSTGRES_WORKSPACE")
-        or os.getenv("QWEN_POSTGRES_WORKSPACE")
-        or "default"
-    )
+    workspace = get_postgres_workspace()
     connection = await asyncpg.connect(
         host=os.getenv("POSTGRES_HOST") or os.getenv("PGHOST") or "localhost",
         port=int(os.getenv("POSTGRES_PORT") or os.getenv("PGPORT") or "5432"),
@@ -1219,7 +1221,7 @@ async def load_postgres_chunks() -> list[dict[str, Any]]:
 
 
 def load_local_chunks(working_dir: Path) -> list[dict[str, Any]]:
-    chunks_path = working_dir / "kv_store_text_chunks.json"
+    chunks_path = resolve_path_from_save(working_dir / "kv_store_text_chunks.json")
     if not chunks_path.exists():
         return []
     with chunks_path.open("r", encoding="utf-8") as f:
@@ -2096,6 +2098,347 @@ def normalize_storage(storage: str | None) -> str:
             f"Unsupported storage: {storage}. Use local, postgres, or postgres-age."
         )
     return value
+
+
+def get_postgres_workspace() -> str:
+    return (
+        os.getenv("PG_WORKSPACE")
+        or os.getenv("POSTGRES_WORKSPACE")
+        or os.getenv("QWEN_POSTGRES_WORKSPACE")
+        or "default"
+    )
+
+
+def set_postgres_workspace(workspace: str | None) -> None:
+    if not workspace:
+        return
+    workspace = workspace.strip()
+    if not workspace:
+        return
+    os.environ["POSTGRES_WORKSPACE"] = workspace
+    os.environ["QWEN_POSTGRES_WORKSPACE"] = workspace
+    os.environ["PG_WORKSPACE"] = workspace
+
+
+def safe_workspace_dir_name(workspace: str) -> str:
+    value = re.sub(r"[^0-9A-Za-z_.-]+", "_", workspace.strip())
+    value = value.strip("._")
+    return value or "default"
+
+
+def default_working_dir_for_storage(storage: str | None = None) -> str:
+    storage = normalize_storage(storage)
+    if storage in {"postgres", "postgres-age"}:
+        workspace_dir = safe_workspace_dir_name(get_postgres_workspace())
+        return str(DEFAULT_POSTGRES_WORKING_DIR_BASE / workspace_dir)
+    return DEFAULT_WORKING_DIR
+
+
+def resolve_working_dir(working_dir: str | None, storage: str | None = None) -> str:
+    if working_dir:
+        return working_dir
+    return default_working_dir_for_storage(storage)
+
+
+def get_save_root() -> Path:
+    return Path(os.getenv("QWEN_SAVE_ROOT") or DEFAULT_SAVE_ROOT).expanduser()
+
+
+def path_relative_to_project(path: Path) -> Path:
+    resolved = path.expanduser().resolve()
+    for root in (RAGANYTHING_ROOT, WORKSPACE_ROOT):
+        try:
+            return resolved.relative_to(root.resolve())
+        except ValueError:
+            continue
+    drive = resolved.drive.replace(":", "") or "root"
+    return Path("_external") / drive / Path(*resolved.parts[1:])
+
+
+def save_mirror_path(path: str | Path) -> Path:
+    path_obj = Path(path).expanduser()
+    return get_save_root() / path_relative_to_project(path_obj)
+
+
+def infer_artifact_type(path: str | Path) -> str:
+    path_obj = Path(path)
+    parts = {part.lower() for part in path_obj.parts}
+    name = path_obj.name.lower()
+    suffix = path_obj.suffix.lower()
+    if "structured_chunks" in parts:
+        return "structured_chunks"
+    if "mineru_failures" in parts:
+        return "mineru_failure"
+    if name == "batch_import_manifest.json":
+        return "batch_manifest"
+    if name == "batch_import_report.md":
+        return "batch_report"
+    if "qwen_policy_qa" in parts:
+        return "qa_output"
+    if name in {"graph_chunk_entity_relation.graphml", "graph_chunk_entity_relation.gpickle"}:
+        return "networkx_graph"
+    if name.startswith("graph_") or suffix in {".graphml", ".gpickle"}:
+        return "networkx_graph"
+    if "qwen_policy_parser" in parts or name.endswith("_content_list.json") or name.endswith("_content_list_v2.json"):
+        return "parser_output"
+    if "rag_storage" in parts:
+        return "rag_working_file"
+    return "runtime_file"
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def postgres_connect_kwargs() -> dict[str, Any]:
+    return {
+        "host": os.getenv("POSTGRES_HOST") or os.getenv("PGHOST") or "localhost",
+        "port": int(os.getenv("POSTGRES_PORT") or os.getenv("PGPORT") or "5432"),
+        "user": os.getenv("POSTGRES_USER") or os.getenv("PGUSER") or "postgres",
+        "password": os.getenv("POSTGRES_PASSWORD") or os.getenv("PGPASSWORD"),
+        "database": os.getenv("POSTGRES_DATABASE") or os.getenv("PGDATABASE") or "postgres",
+    }
+
+
+def should_record_runtime_artifacts() -> bool:
+    if _RUNTIME_ARTIFACT_DB_DISABLED:
+        return False
+    storage = normalize_storage(os.getenv("QWEN_STORAGE") or "postgres")
+    return storage in {"postgres", "postgres-age"} and env_bool("QWEN_ARTIFACT_DB_SYNC", True)
+
+
+def report_runtime_artifact_warning(exc: Exception) -> None:
+    global _RUNTIME_ARTIFACT_WARNING_REPORTED, _RUNTIME_ARTIFACT_DB_DISABLED
+    _RUNTIME_ARTIFACT_DB_DISABLED = True
+    if _RUNTIME_ARTIFACT_WARNING_REPORTED:
+        return
+    _RUNTIME_ARTIFACT_WARNING_REPORTED = True
+    print(
+        "提示: runtime_artifacts 自动登记失败，文件已同步到 save；"
+        f"如需入库请先执行 db/schema.sql。错误: {exc}",
+        flush=True,
+    )
+
+
+def runtime_artifact_task_done(task: asyncio.Task) -> None:
+    _RUNTIME_ARTIFACT_TASKS.discard(task)
+    try:
+        exc = task.exception()
+    except asyncio.CancelledError:
+        return
+    if exc:
+        report_runtime_artifact_warning(exc)
+
+
+async def record_runtime_artifact(
+    local_path: str | Path,
+    save_path: str | Path,
+    *,
+    artifact_type: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    if not should_record_runtime_artifacts():
+        return
+
+    source = Path(local_path).expanduser()
+    saved = Path(save_path).expanduser()
+    if not source.is_file() or not saved:
+        return
+
+    try:
+        import asyncpg
+    except ImportError:
+        return
+
+    logical_path = path_relative_to_project(source).as_posix()
+    artifact_type = artifact_type or infer_artifact_type(source)
+    mime_type = mimetypes.guess_type(str(source))[0]
+    stat = source.stat()
+    payload = {
+        "workspace": get_postgres_workspace(),
+        **(metadata or {}),
+    }
+
+    connection = await asyncpg.connect(**postgres_connect_kwargs())
+    try:
+        await connection.execute(
+            """
+            INSERT INTO runtime_artifacts (
+                artifact_type,
+                logical_path,
+                local_path,
+                save_path,
+                file_hash,
+                file_size,
+                mime_type,
+                metadata
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)
+            ON CONFLICT (artifact_type, save_path)
+            DO UPDATE SET
+                logical_path = EXCLUDED.logical_path,
+                local_path = EXCLUDED.local_path,
+                file_hash = EXCLUDED.file_hash,
+                file_size = EXCLUDED.file_size,
+                mime_type = EXCLUDED.mime_type,
+                metadata = runtime_artifacts.metadata || EXCLUDED.metadata,
+                updated_at = now()
+            """,
+            artifact_type,
+            logical_path,
+            str(source.resolve()),
+            str(saved.resolve()),
+            file_sha256(source),
+            stat.st_size,
+            mime_type,
+            json.dumps(payload, ensure_ascii=False),
+        )
+    finally:
+        await connection.close()
+
+
+def schedule_runtime_artifact_record(
+    local_path: str | Path,
+    save_path: str | Path,
+    *,
+    artifact_type: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    if not should_record_runtime_artifacts():
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        try:
+            asyncio.run(
+                record_runtime_artifact(
+                    local_path,
+                    save_path,
+                    artifact_type=artifact_type,
+                    metadata=metadata,
+                )
+            )
+        except Exception as exc:
+            report_runtime_artifact_warning(exc)
+        return
+
+    task = loop.create_task(
+        record_runtime_artifact(
+            local_path,
+            save_path,
+            artifact_type=artifact_type,
+            metadata=metadata,
+        )
+    )
+    _RUNTIME_ARTIFACT_TASKS.add(task)
+    task.add_done_callback(runtime_artifact_task_done)
+
+
+async def flush_runtime_artifact_records() -> None:
+    if not _RUNTIME_ARTIFACT_TASKS:
+        return
+    results = await asyncio.gather(*list(_RUNTIME_ARTIFACT_TASKS), return_exceptions=True)
+    for result in results:
+        if isinstance(result, Exception):
+            report_runtime_artifact_warning(result)
+
+
+def resolve_path_from_save(path: str | Path) -> Path:
+    path_obj = Path(path).expanduser()
+    if path_obj.exists():
+        return path_obj
+    mirror_path = save_mirror_path(path_obj)
+    if mirror_path.exists():
+        return mirror_path
+    return path_obj
+
+
+def restore_file_from_save(path: str | Path) -> Path:
+    path_obj = Path(path).expanduser()
+    if path_obj.exists():
+        return path_obj
+    mirror_path = save_mirror_path(path_obj)
+    if mirror_path.is_file():
+        path_obj.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(mirror_path, path_obj)
+    return path_obj
+
+
+def restore_path_from_save(path: str | Path) -> Path:
+    path_obj = Path(path).expanduser()
+    if path_obj.exists():
+        return path_obj
+    mirror_path = save_mirror_path(path_obj)
+    if mirror_path.is_file():
+        return restore_file_from_save(path_obj)
+    if mirror_path.is_dir():
+        for source in mirror_path.rglob("*"):
+            if not source.is_file():
+                continue
+            target = path_obj / source.relative_to(mirror_path)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
+    return path_obj
+
+
+def sync_file_to_save(path: str | Path) -> Path | None:
+    if not env_bool("QWEN_SAVE_SYNC", True):
+        return None
+    source = Path(path).expanduser()
+    if not source.is_file():
+        return None
+    save_root = get_save_root().resolve()
+    resolved = source.resolve()
+    try:
+        resolved.relative_to(save_root)
+        return None
+    except ValueError:
+        pass
+    target = save_mirror_path(source)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, target)
+    schedule_runtime_artifact_record(source, target)
+    return target
+
+
+def sync_tree_to_save(path: str | Path) -> Path | None:
+    if not env_bool("QWEN_SAVE_SYNC", True):
+        return None
+    source_root = Path(path).expanduser()
+    if not source_root.exists():
+        return None
+    if source_root.is_file():
+        return sync_file_to_save(source_root)
+
+    save_root = get_save_root().resolve()
+    try:
+        source_root.resolve().relative_to(save_root)
+        return None
+    except ValueError:
+        pass
+
+    target_root = save_mirror_path(source_root)
+    for source in source_root.rglob("*"):
+        if not source.is_file():
+            continue
+        target = target_root / source.relative_to(source_root)
+        if target.exists():
+            try:
+                same_size = target.stat().st_size == source.stat().st_size
+                newer_or_same = target.stat().st_mtime >= source.stat().st_mtime
+                if same_size and newer_or_same:
+                    schedule_runtime_artifact_record(source, target)
+                    continue
+            except OSError:
+                pass
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
+        schedule_runtime_artifact_record(source, target)
+    return target_root
 
 
 def storage_backend_names(storage: str | None = None) -> dict[str, str]:

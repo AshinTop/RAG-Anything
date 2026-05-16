@@ -17,8 +17,11 @@ from qwen_policy_common import (
     DEFAULT_WORKING_DIR,
     build_qwen_policy_rag,
     describe_storage_backends,
+    flush_runtime_artifact_records,
     insert_retrieval_only_chunks,
     normalize_storage,
+    restore_path_from_save,
+    sync_tree_to_save,
 )
 from import_policy_files import (
     assert_text_insert_succeeded,
@@ -211,7 +214,7 @@ def infer_source_reference(content_list_path: Path, source_file: str | None) -> 
 def resolve_content_list_paths(paths: list[str], recursive: bool) -> list[Path]:
     result: list[Path] = []
     for raw_path in paths:
-        path = Path(raw_path).expanduser()
+        path = restore_path_from_save(Path(raw_path).expanduser())
         if path.is_file():
             result.append(path)
             continue
@@ -229,6 +232,7 @@ def resolve_content_list_paths(paths: list[str], recursive: bool) -> list[Path]:
 
 
 async def import_parsed_content_lists(args: argparse.Namespace) -> None:
+    restore_path_from_save(args.working_dir)
     files = resolve_content_list_paths(args.content_lists, recursive=args.recursive)
     if not files:
         raise RuntimeError("没有找到 content_list JSON 文件。")
@@ -339,6 +343,9 @@ async def import_parsed_content_lists(args: argparse.Namespace) -> None:
             print(f"[{index}/{len(files)}] 导入完成: {content_list_path.name}", flush=True)
     finally:
         await rag.finalize_storages()
+        sync_tree_to_save(args.working_dir)
+        sync_tree_to_save(args.output_dir)
+        await flush_runtime_artifact_records()
 
     print("\n全部解析结果导入完成。该脚本不会重新运行 MinerU，也不执行问答。")
 
