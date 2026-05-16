@@ -31,6 +31,7 @@ class StructuredChunk:
     content_type: str
     content: str
     source_block_range: list[int]
+    source_metadata: dict[str, Any] | None = None
 
     @property
     def section_path(self) -> str:
@@ -45,6 +46,27 @@ class StructuredChunk:
             f"chunk_order_index：{self.chunk_order_index}",
             f"内容类型：{self.content_type}",
         ]
+        if self.source_metadata:
+            source_collection = self.source_metadata.get("source_collection")
+            relative_path = self.source_metadata.get("relative_path")
+            directory_path = self.source_metadata.get("directory_path")
+            directory_tags = self.source_metadata.get("directory_tags")
+            business_category = self.source_metadata.get("business_category")
+            file_hash = self.source_metadata.get("file_hash")
+            if source_collection:
+                metadata_lines.append(f"来源集合：{source_collection}")
+            if relative_path:
+                metadata_lines.append(f"相对路径：{relative_path}")
+            if directory_path:
+                metadata_lines.append(f"目录路径：{directory_path}")
+            if directory_tags:
+                if isinstance(directory_tags, list):
+                    directory_tags = " > ".join(str(tag) for tag in directory_tags)
+                metadata_lines.append(f"目录标签：{directory_tags}")
+            if business_category:
+                metadata_lines.append(f"业务分类：{business_category}")
+            if file_hash:
+                metadata_lines.append(f"文件hash：{file_hash}")
         if self.page_idx is not None:
             metadata_lines.append(f"页码：{self.page_idx + 1}")
         if self.section_path:
@@ -85,7 +107,11 @@ def page_from_text(text: str, fallback: int | None) -> int | None:
 
 
 def build_structured_chunks(
-    text_items: list[dict[str, Any]], *, doc_id: str, file_name: str
+    text_items: list[dict[str, Any]],
+    *,
+    doc_id: str,
+    file_name: str,
+    source_metadata: dict[str, Any] | None = None,
 ) -> list[StructuredChunk]:
     chunks: list[StructuredChunk] = []
     chapter_title: str | None = None
@@ -118,6 +144,7 @@ def build_structured_chunks(
                 content_type="article" if current_article_no else "section_text",
                 content=content,
                 source_block_range=[current_start_block or end_block, end_block],
+                source_metadata=source_metadata,
             )
         )
         current_article_no = None
@@ -140,6 +167,7 @@ def build_structured_chunks(
                 content_type="table",
                 content=paragraph,
                 source_block_range=[block_index, block_index],
+                source_metadata=source_metadata,
             )
         )
 

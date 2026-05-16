@@ -6,6 +6,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import re
+import sys
+from datetime import datetime
 from pathlib import Path
 
 from qwen_policy_common import (
@@ -13,12 +16,17 @@ from qwen_policy_common import (
     DEFAULT_WORKING_DIR,
     STRICT_ANSWER_SYSTEM_PROMPT,
     build_chunk_focused_context,
+    build_protected_table_answer_prefix,
     build_strict_answer_prompt,
     build_qwen_policy_rag,
+    clean_answer_text,
     load_index_chunks,
     normalize_storage,
 )
 from lightrag import QueryParam
+
+
+DEFAULT_QA_OUTPUT_DIR = str(Path(__file__).resolve().parents[2] / "output" / "qwen_policy_qa")
 
 
 def local_index_has_chunks(working_dir: Path) -> bool:
@@ -43,6 +51,63 @@ def local_index_has_chunks(working_dir: Path) -> bool:
             pass
 
     return False
+
+
+def safe_filename_part(text: str, max_length: int = 40) -> str:
+    text = re.sub(r"\s+", "", text or "")
+    text = re.sub(r'[\\/:*?"<>|`]+', "_", text)
+    text = re.sub(r"_+", "_", text).strip("._")
+    return (text[:max_length] or "question")
+
+
+def write_qa_output(
+    *,
+    output_dir: str,
+    args: argparse.Namespace,
+    question_index: int,
+    question: str,
+    raw_prompt: str,
+    focused_context: str,
+    answer: str,
+) -> Path:
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    file_path = output_path / f"{timestamp}_q{question_index}_{safe_filename_part(question)}.txt"
+    args_dict = {
+        key: value
+        for key, value in vars(args).items()
+        if key != "system_prompt"
+    }
+    content = [
+        "Qwen Policy RAG QA Result",
+        "=" * 80,
+        f"timestamp: {datetime.now().isoformat(timespec='seconds')}",
+        f"command: {' '.join(sys.argv)}",
+        "",
+        "Execution Arguments",
+        "-" * 80,
+        json.dumps(args_dict, ensure_ascii=False, indent=2),
+        "",
+        "Question",
+        "-" * 80,
+        question,
+        "",
+        "Raw Prompt",
+        "-" * 80,
+        raw_prompt or "",
+        "",
+        "Focused Context",
+        "-" * 80,
+        focused_context or "",
+        "",
+        "Answer",
+        "-" * 80,
+        answer or "",
+        "",
+    ]
+    file_path.write_text("\n".join(content), encoding="utf-8")
+    return file_path
 
 
 async def query(args: argparse.Namespace) -> None:
@@ -81,9 +146,11 @@ async def query(args: argparse.Namespace) -> None:
         raise RuntimeError("请传入一个问题，或用 -q 传入多个问题。")
 
     try:
-        index_chunks = await load_index_chunks(args.working_dir, storage) if args.strict_answer else []
+        index_chunks: list[dict] = []
         for index, question in enumerate(questions, start=1):
             print(f"\n[{index}] Q: {question}\n", flush=True)
+            raw_prompt = ""
+            focused_context = ""
             if args.strict_answer:
                 raw_prompt = await rag.lightrag.aquery(
                     question,
@@ -99,7 +166,14 @@ async def query(args: argparse.Namespace) -> None:
                     print("RAW PROMPT:\n")
                     print(raw_prompt)
                     print("\n--- END RAW PROMPT ---\n")
-                focused_context = build_chunk_focused_context(index_chunks, question)
+                focused_context = build_chunk_focused_context(
+                    index_chunks,
+                    question,
+                    raw_prompt=raw_prompt,
+                )
+                if not focused_context:
+                    index_chunks = await load_index_chunks(args.working_dir, storage)
+                    focused_context = build_chunk_focused_context(index_chunks, question)
                 if args.dump_prompt and focused_context:
                     print("FOCUSED CONTEXT:\n")
                     print(focused_context)
@@ -109,6 +183,13 @@ async def query(args: argparse.Namespace) -> None:
                     system_prompt=args.system_prompt,
                     temperature=0,
                 )
+                protected_table_prefix = build_protected_table_answer_prefix(
+                    question, focused_context
+                )
+                if protected_table_prefix:
+                    answer = protected_table_prefix
+                else:
+                    answer = clean_answer_text(str(answer))
             else:
                 answer = await rag.aquery(
                     question,
@@ -119,8 +200,20 @@ async def query(args: argparse.Namespace) -> None:
                     enable_rerank=args.enable_rerank,
                     vlm_enhanced=args.vlm,
                 )
+                answer = clean_answer_text(str(answer))
             print("A:\n")
             print(answer)
+            if args.save_output:
+                output_file = write_qa_output(
+                    output_dir=args.qa_output_dir,
+                    args=args,
+                    question_index=index,
+                    question=question,
+                    raw_prompt=raw_prompt,
+                    focused_context=focused_context,
+                    answer=str(answer),
+                )
+                print(f"\nQA 结果已保存: {output_file}")
     finally:
         await rag.finalize_storages()
 
@@ -200,6 +293,17 @@ def parse_args() -> argparse.Namespace:
         "--dump-prompt",
         action="store_true",
         help="打印 LightRAG 生成的原始检索提示，用于排查模型是否拿到了正确原文。",
+    )
+    parser.add_argument(
+        "--save-output",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="默认每个 QA 保存一个本地 text 文件；传 --no-save-output 可关闭。",
+    )
+    parser.add_argument(
+        "--qa-output-dir",
+        default=DEFAULT_QA_OUTPUT_DIR,
+        help="QA 结果保存目录，默认 output/qwen_policy_qa。",
     )
     return parser.parse_args()
 

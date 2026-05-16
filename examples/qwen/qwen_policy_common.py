@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import os
 import re
 import sys
@@ -142,6 +143,12 @@ STRICT_ANSWER_SYSTEM_PROMPT = (
     "比例要求、上下限说明、适用条件。只要原文出现了这些内容，就不要省略。\n"
     "对于连续条款，不要只列前两条；必须继续检查后续条款，直到该小节结束或进入下一节。\n"
     "如果片段含相同“章节路径”的多条内容或表格，必须综合这些同章节内容回答，不要只使用第一条。\n"
+    "如果问题问“包含哪些”“有哪些”“名录”“清单”，且原文片段中有表格，必须按表格逐行抽取。"
+    "数量较多时可以只列名称或关键列，但不得写“因篇幅限制仅展示部分”“其余略”等截断语。"
+    "除非用户明确要求示例，否则不能只给部分示例。\n"
+    "如果原文片段包含“|”分隔的表格行，回答涉及表格时必须原样使用表格中的行、列和值；"
+    "不得重排表头、不得把空值或破折号改成数值、不得换算单位、不得补充表格中不存在的数值。"
+    "需要整理成 Markdown 表格时，只能复制原表格单元格内容。\n"
     "5. 答案必须使用以下结构：\n"
     "结论：\n"
     "依据：\n"
@@ -153,6 +160,18 @@ STRICT_ANSWER_SYSTEM_PROMPT = (
 
 def build_strict_answer_prompt(raw_prompt: str, question: str, focused_context: str | None = None) -> str:
     focused_context = focused_context or extract_focused_context(raw_prompt, question)
+    protected_tables = build_protected_table_context(question, focused_context)
+    protected_instruction = ""
+    if protected_tables:
+        protected_instruction = f"""
+
+不可改写表格：
+```
+{protected_tables}
+```
+上方“不可改写表格”会由程序原样附加到最终答案中。你不要重新生成、重排或改写这些表格；
+只需要用不超过 6 条短句解释表格含义、适用条件、注释和引用依据。
+禁止在解释中新增或改写任何数字、百分比、标准号、条款编号；如需提到数字或条款，只能逐字引用原文已有表述。"""
     return f"""/no_think
 请根据下面的“问题相关原文片段”回答用户问题。
 
@@ -163,9 +182,153 @@ def build_strict_answer_prompt(raw_prompt: str, question: str, focused_context: 
 ```
 {focused_context}
 ```
+{protected_instruction}
 
 只能使用上方原文片段。不要使用外部知识，不要引用上方片段没有出现的文件名、标准号、条款号、页码、数值或单位。
+如果用户询问“包含哪些”“有哪些”“名录”“清单”，必须尽量完整列出原文片段中对应表格的所有条目；不得只展示部分示例，不得使用“因篇幅限制”“其余略”等截断表述。
+如果问题相关原文片段中含有“|”分隔表格，回答中涉及该表格时必须原样复制表格行和值；不得自行转置、重排、换算、补齐空值或改写任何数值。
 """
+
+
+def build_protected_table_answer_prefix(question: str, focused_context: str) -> str:
+    protected_tables = build_protected_table_context(question, focused_context)
+    if not protected_tables:
+        return ""
+    return (
+        "原文表格：\n"
+        "以下表格由程序直接从检索片段复制，未经过模型改写。\n\n"
+        f"{protected_tables}"
+        "\n\n说明：\n"
+        "表格中的数值、空值和单位请以上方原文表格为准。"
+    )
+
+
+def build_protected_table_context(question: str, focused_context: str) -> str:
+    blocks = extract_pipe_table_blocks(focused_context)
+    if not blocks:
+        return ""
+    terms = build_focus_terms(question)
+    scored = [
+        (score_focus_snippet(block, terms, terms), index, block)
+        for index, block in enumerate(blocks)
+    ]
+    scored.sort(key=lambda item: item[0], reverse=True)
+    if scored[0][0] <= 0:
+        return ""
+    return scored[0][2]
+
+
+def extract_pipe_table_blocks(text: str) -> list[str]:
+    lines = str(text or "").splitlines()
+    blocks: list[str] = []
+    index = 0
+    while index < len(lines):
+        if "|" not in lines[index]:
+            index += 1
+            continue
+
+        start = index
+        for cursor in range(index - 1, -1, -1):
+            stripped = lines[cursor].strip()
+            if not stripped or stripped.startswith("---") or stripped.startswith("[参考内容"):
+                break
+            if stripped == "正文：":
+                start = cursor + 1
+                break
+            start = cursor
+
+        end = index + 1
+        while end < len(lines):
+            stripped = lines[end].strip()
+            if stripped.startswith("---") or stripped.startswith("[参考内容"):
+                break
+            if stripped.startswith("表格作答要求："):
+                break
+            if not stripped and end > index:
+                break
+            end += 1
+
+        block = "\n".join(line.rstrip() for line in lines[start:end]).strip()
+        if block and block not in blocks:
+            blocks.append(block)
+        index = max(end, index + 1)
+    return blocks
+
+
+def strip_markdown_tables(text: str) -> str:
+    """Remove model-generated pipe tables when a protected source table is present."""
+    lines = str(text or "").splitlines()
+    kept: list[str] = []
+    skipping = False
+    for line in lines:
+        stripped = line.strip()
+        is_table_line = "|" in stripped and stripped.count("|") >= 2
+        is_separator = bool(re.match(r"^\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?$", stripped))
+        if is_table_line or is_separator:
+            skipping = True
+            continue
+        if skipping and not stripped:
+            skipping = False
+            continue
+        skipping = False
+        kept.append(line)
+    return "\n".join(kept).strip()
+
+
+def clean_answer_text(text: str) -> str:
+    """Remove common model output noise without changing factual content."""
+    cleaned_lines: list[str] = []
+    noise_lines = {"出手", "好的", "以下是答案", "根据提供的内容"}
+    for raw_line in str(text or "").splitlines():
+        line = raw_line.rstrip()
+        stripped = line.strip()
+        if not stripped:
+            cleaned_lines.append("")
+            continue
+        if stripped in noise_lines:
+            continue
+        stripped = re.sub(r"^\*+([^*]+)\*+[:：]?", r"\1：", stripped)
+        stripped = re.sub(r"\*\*", "", stripped)
+        stripped = re.sub(r"(?<!\*)\*(?!\*)", "", stripped)
+        cleaned_lines.append(stripped)
+
+    text = "\n".join(cleaned_lines)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def sanitize_protected_table_explanation(text: str, protected_table: str) -> str:
+    """Keep LLM explanation conservative when the table itself is program-copied."""
+    allowed_numbers = set(re.findall(r"\d+(?:\.\d+)?(?:~\d+(?:\.\d+)?)?%?", protected_table))
+    allowed_numbers.update(re.findall(r"第[一二三四五六七八九十百零〇\d]+条", protected_table))
+
+    kept: list[str] = []
+    for raw_line in strip_markdown_tables(text).splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("#") or line.startswith("---"):
+            continue
+        line = re.sub(r"^\s*[-*]\s*", "", line)
+        line = re.sub(r"^\s*\d+[\.、]\s*", "", line)
+
+        numbers = set(re.findall(r"\d+(?:\.\d+)?(?:~\d+(?:\.\d+)?)?%?", line))
+        clauses = set(re.findall(r"第[一二三四五六七八九十百零〇\d]+条", line))
+        if any(value not in allowed_numbers for value in numbers | clauses):
+            continue
+
+        # Drop lines that look like fresh normative claims with numbers; the
+        # copied table already carries exact values.
+        if numbers and any(word in line for word in ["不得超过", "不应超过", "增加", "比例", "为"]):
+            if line not in protected_table:
+                continue
+
+        if line and line not in kept:
+            kept.append(line)
+        if len(kept) >= 6:
+            break
+
+    return "\n".join(f"- {line}" for line in kept)
 
 
 async def load_index_chunks(working_dir: str, storage: str) -> list[dict[str, Any]]:
@@ -334,8 +497,16 @@ async def insert_retrieval_only_chunks(
 
 
 def build_chunk_focused_context(
-    chunks: list[dict[str, Any]], question: str, *, max_chunks: int = 8
+    chunks: list[dict[str, Any]],
+    question: str,
+    *,
+    max_chunks: int = 8,
+    raw_prompt: str | None = None,
 ) -> str:
+    raw_chunks = extract_raw_prompt_document_chunks(raw_prompt or "")
+    if raw_chunks:
+        chunks = raw_chunks
+
     if not chunks:
         return ""
 
@@ -354,7 +525,7 @@ def build_chunk_focused_context(
     else:
         _, top_index, top_chunk = scored[0]
         selected_indexes = [top_index]
-        top_doc_id = top_chunk.get("full_doc_id")
+        top_doc_id = top_chunk.get("full_doc_id") or top_chunk.get("reference_id")
         top_meta = parse_structured_chunk_metadata(str(top_chunk.get("content") or ""))
         top_section_path = top_meta.get("章节路径")
 
@@ -366,7 +537,7 @@ def build_chunk_focused_context(
                 neighbor = chunks[neighbor_index]
                 neighbor_content = str(neighbor.get("content") or "")
                 if (
-                    neighbor.get("full_doc_id") == top_doc_id
+                    (neighbor.get("full_doc_id") or neighbor.get("reference_id")) == top_doc_id
                     and is_related_neighbor(neighbor_content, high_priority_terms)
                 ):
                     selected_indexes.append(neighbor_index)
@@ -379,7 +550,7 @@ def build_chunk_focused_context(
                     break
                 if neighbor_index in selected_indexes:
                     continue
-                if neighbor.get("full_doc_id") != top_doc_id:
+                if (neighbor.get("full_doc_id") or neighbor.get("reference_id")) != top_doc_id:
                     continue
                 neighbor_meta = parse_structured_chunk_metadata(
                     str(neighbor.get("content") or "")
@@ -394,14 +565,101 @@ def build_chunk_focused_context(
         chunk = chunks[chunk_index]
         file_path = Path(str(chunk.get("file_path") or "")).name or "来源未标明"
         order = chunk.get("chunk_order_index")
+        content = format_focused_chunk_content(str(chunk.get("content") or ""))
         parts.append(
             f"[参考内容{ref_index}]\n"
             f"chunk_id: {chunk.get('id')}\n"
             f"chunk_order_index: {order}\n"
             f"文件: 《{file_path}》\n"
-            f"原文:\n{str(chunk.get('content') or '').strip()}"
+            f"原文:\n{content}"
         )
     return "\n\n---\n\n".join(parts)
+
+
+def format_focused_chunk_content(content: str) -> str:
+    content = str(content or "").strip()
+    if "<table" not in content.lower():
+        return annotate_pipe_table_context(content)
+
+    rows = html_table_rows_to_text(content)
+    if not rows:
+        return content
+
+    prefix = content
+    table_start = re.search(r"<table\b", content, flags=re.IGNORECASE)
+    if table_start:
+        prefix = content[: table_start.start()].strip()
+    return annotate_pipe_table_context(prefix + "\n表格转写：\n" + "\n".join(rows))
+
+
+def annotate_pipe_table_context(content: str) -> str:
+    """Add a generic instruction near pipe-delimited tables to reduce value drift."""
+    if "表格作答要求：" in content:
+        return content
+    pipe_line_count = sum(1 for line in content.splitlines() if "|" in line)
+    if pipe_line_count < 2:
+        return content
+    return (
+        content
+        + "\n\n表格作答要求：上方包含“|”分隔表格行；回答涉及该表格时必须逐行原样引用"
+        "表格中的单元格和值，不得自行重排表头、换算单位、补齐空值或改写数值。"
+    )
+
+
+def html_table_rows_to_text(content: str) -> list[str]:
+    rows: list[str] = []
+    for row_match in re.finditer(r"<tr\b[^>]*>(.*?)</tr>", content, flags=re.IGNORECASE | re.DOTALL):
+        row_html = row_match.group(1)
+        cells: list[str] = []
+        for cell_match in re.finditer(
+            r"<t[dh]\b[^>]*>(.*?)</t[dh]>",
+            row_html,
+            flags=re.IGNORECASE | re.DOTALL,
+        ):
+            cell = re.sub(r"<[^>]+>", "", cell_match.group(1))
+            cell = html.unescape(cell)
+            cell = re.sub(r"\s+", " ", cell).strip()
+            cells.append(cell)
+        if cells:
+            rows.append(" | ".join(cells))
+    return rows
+
+
+def extract_raw_prompt_document_chunks(raw_prompt: str) -> list[dict[str, Any]]:
+    """Parse LightRAG's only_need_prompt output and keep retrieval-scoped chunks.
+
+    The strict answer stage must not re-rank the whole database when LightRAG has
+    already retrieved a relevant set. Reusing the raw prompt chunks prevents a
+    correct hit from being replaced by unrelated old documents during local
+    focusing.
+    """
+    if not raw_prompt:
+        return []
+
+    chunks: list[dict[str, Any]] = []
+    for line in raw_prompt.splitlines():
+        stripped = line.strip()
+        if not (stripped.startswith("{") and stripped.endswith("}")):
+            continue
+        try:
+            item = json.loads(stripped)
+        except json.JSONDecodeError:
+            continue
+        content = item.get("content")
+        if not isinstance(content, str) or not content.strip():
+            continue
+        meta = parse_structured_chunk_metadata(content)
+        chunks.append(
+            {
+                "id": meta.get("chunk_id") or f"raw-{len(chunks)}",
+                "reference_id": str(item.get("reference_id") or ""),
+                "full_doc_id": meta.get("文件hash") or str(item.get("reference_id") or ""),
+                "chunk_order_index": meta.get("chunk_order_index") or len(chunks),
+                "content": content,
+                "file_path": meta.get("相对路径") or meta.get("文件") or "",
+            }
+        )
+    return chunks
 
 
 def is_related_neighbor(content: str, high_priority_terms: list[str]) -> bool:
@@ -422,6 +680,12 @@ def parse_structured_chunk_metadata(content: str) -> dict[str, str]:
             "chunk_id",
             "chunk_order_index",
             "内容类型",
+            "来源集合",
+            "相对路径",
+            "目录路径",
+            "目录标签",
+            "业务分类",
+            "文件hash",
             "页码",
             "章节路径",
             "条款",
@@ -436,8 +700,7 @@ def extract_focused_context(raw_prompt: str, question: str, window: int = 1800) 
         return ""
 
     terms = build_focus_terms(question)
-    generic_terms = {"建设用地", "用地面积", "用地指标"}
-    high_priority_terms = [term for term in terms if term not in generic_terms]
+    high_priority_terms = terms
     candidates: list[tuple[int, int, int, str]] = []
 
     for term in terms:
@@ -485,17 +748,13 @@ def score_focus_snippet(
         score += 40
     if "表格" in snippet or "<table" in snippet:
         score += 30
-    if "工程项目" in snippet:
-        score += 20
-
-    # Avoid snippets that only match broad words such as "建设用地".
     if not any(term in snippet for term in high_priority_terms):
         score -= 200
     return score
 
 
 def build_focus_terms(question: str) -> list[str]:
-    text = re.sub(r"[？?，,。；;：:\s]+", "", question or "")
+    text = re.sub(r"[？?，,。；;：:\s（）()【】\[\]《》“”\"'、]+", "", question or "")
 
     terms: list[str] = []
     if len(text) >= 4:
@@ -503,12 +762,12 @@ def build_focus_terms(question: str) -> list[str]:
 
     # Generate long n-grams directly from the question instead of maintaining
     # domain-specific stop-word lists.
-    for size in range(min(12, len(text)), 3, -1):
+    for size in range(min(12, len(text)), 1, -1):
         for index in range(0, max(0, len(text) - size + 1)):
             gram = text[index : index + size]
             if gram not in terms:
                 terms.append(gram)
-        if len(terms) >= 10:
+        if len(terms) >= 80:
             break
 
     deduped: list[str] = []
@@ -766,15 +1025,15 @@ def apply_chinese_policy_prompts() -> None:
 
     LIGHTRAG_PROMPTS["entity_extraction_examples"] = [
         """示例文本：
-《城市生活垃圾处理和给水与污水处理工程项目建设用地指标》由建设部、国土资源部批准发布，适用于城市生活垃圾处理工程、给水工程和污水处理工程项目。
+《某专项管理办法》由甲部门、乙部门联合发布，适用于本行政区域内相关项目的申报、审批和监督管理工作。
 
 示例输出：
-entity{tuple_delimiter}《城市生活垃圾处理和给水与污水处理工程项目建设用地指标》{tuple_delimiter}政策文件{tuple_delimiter}该文件是由建设部、国土资源部批准发布的工程项目建设用地指标文件。
-entity{tuple_delimiter}建设部{tuple_delimiter}发布机构{tuple_delimiter}建设部是批准发布该建设用地指标的机构之一。
-entity{tuple_delimiter}国土资源部{tuple_delimiter}发布机构{tuple_delimiter}国土资源部是批准发布该建设用地指标的机构之一。
-entity{tuple_delimiter}城市生活垃圾处理工程{tuple_delimiter}工程项目{tuple_delimiter}城市生活垃圾处理工程是该建设用地指标的适用对象之一。
-relation{tuple_delimiter}建设部{tuple_delimiter}《城市生活垃圾处理和给水与污水处理工程项目建设用地指标》{tuple_delimiter}批准发布{tuple_delimiter}建设部批准发布该建设用地指标文件。
-relation{tuple_delimiter}《城市生活垃圾处理和给水与污水处理工程项目建设用地指标》{tuple_delimiter}城市生活垃圾处理工程{tuple_delimiter}适用于{tuple_delimiter}该文件适用于城市生活垃圾处理工程项目。
+entity{tuple_delimiter}《某专项管理办法》{tuple_delimiter}政策文件{tuple_delimiter}该文件由甲部门、乙部门联合发布，规定相关项目的申报、审批和监督管理要求。
+entity{tuple_delimiter}甲部门{tuple_delimiter}发布机构{tuple_delimiter}甲部门是发布《某专项管理办法》的机构之一。
+entity{tuple_delimiter}乙部门{tuple_delimiter}发布机构{tuple_delimiter}乙部门是发布《某专项管理办法》的机构之一。
+entity{tuple_delimiter}相关项目{tuple_delimiter}适用对象{tuple_delimiter}相关项目是《某专项管理办法》明确适用的对象。
+relation{tuple_delimiter}甲部门{tuple_delimiter}《某专项管理办法》{tuple_delimiter}发布{tuple_delimiter}甲部门联合发布《某专项管理办法》。
+relation{tuple_delimiter}《某专项管理办法》{tuple_delimiter}相关项目{tuple_delimiter}适用于{tuple_delimiter}《某专项管理办法》适用于本行政区域内相关项目的申报、审批和监督管理工作。
 {completion_delimiter}"""
     ]
 
@@ -1009,6 +1268,7 @@ def make_embedding_func(settings: dict[str, Any]) -> EmbeddingFunc:
 
     async def qwen_embedding_func(texts: list[str]) -> np.ndarray:
         clean_texts = [sanitize_embedding_text(text) for text in texts]
+        allow_fallback = env_bool("QWEN_EMBEDDING_ALLOW_FALLBACK", False)
         client = AsyncOpenAI(
             api_key=settings["embedding_api_key"],
             base_url=settings["embedding_base_url"],
@@ -1024,6 +1284,12 @@ def make_embedding_func(settings: dict[str, Any]) -> EmbeddingFunc:
             except Exception as batch_exc:
                 if "unsupported value: NaN" not in str(batch_exc):
                     raise
+                if not allow_fallback:
+                    raise RuntimeError(
+                        "Embedding batch returned NaN/invalid values. "
+                        "Fix the embedding service or set QWEN_EMBEDDING_ALLOW_FALLBACK=true "
+                        "only for non-evaluation experiments."
+                    ) from batch_exc
 
             vectors = []
             for text in clean_texts:
@@ -1032,7 +1298,13 @@ def make_embedding_func(settings: dict[str, Any]) -> EmbeddingFunc:
                     vector = single_vectors[0]
                     if not valid_vector(vector):
                         raise ValueError("embedding returned non-finite or zero vector")
-                except Exception:
+                except Exception as exc:
+                    if not allow_fallback:
+                        raise RuntimeError(
+                            "Embedding returned invalid vector. "
+                            "Fix the embedding service or set QWEN_EMBEDDING_ALLOW_FALLBACK=true "
+                            "only for non-evaluation experiments."
+                        ) from exc
                     vector = fallback_embedding_vector(text, settings["embedding_dim"])
                 vectors.append(vector)
             return np.array(vectors, dtype=np.float32)

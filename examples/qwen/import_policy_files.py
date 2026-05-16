@@ -6,7 +6,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 import hashlib
+import json
 import os
+from datetime import datetime
 from pathlib import Path
 
 from qwen_policy_common import (
@@ -20,6 +22,7 @@ from qwen_policy_common import (
 )
 
 from raganything.utils import insert_text_content
+from raganything.parser import MineruExecutionError
 from policy_structure import build_structured_chunks, write_structured_chunks_sidecar
 
 
@@ -33,6 +36,227 @@ def detect_cuda_status() -> tuple[bool | None, str | None]:
         return available, device_name
     except Exception:
         return None, None
+
+
+def infer_pdf_parse_method(
+    file_path: Path,
+    *,
+    sample_pages: int = 5,
+    min_chars_per_page: int = 80,
+) -> str | None:
+    """Infer whether a PDF should use MinerU text or OCR mode."""
+    if file_path.suffix.lower() != ".pdf":
+        return None
+
+    try:
+        from pypdf import PdfReader
+
+        reader = PdfReader(str(file_path))
+        page_count = len(reader.pages)
+        if page_count <= 0:
+            return None
+
+        sample_count = min(max(1, sample_pages), page_count)
+        if sample_count == 1:
+            sample_indexes = [0]
+        else:
+            sample_indexes = sorted(
+                {
+                    round(index * (page_count - 1) / (sample_count - 1))
+                    for index in range(sample_count)
+                }
+            )
+
+        page_char_counts = []
+        for page_index in sample_indexes:
+            text = (reader.pages[page_index].extract_text() or "").strip()
+            page_char_counts.append(len(text))
+
+        text_page_count = sum(
+            1 for char_count in page_char_counts if char_count >= min_chars_per_page
+        )
+        text_page_ratio = text_page_count / len(page_char_counts)
+        avg_chars = sum(page_char_counts) / len(page_char_counts)
+
+        print(
+            "PDF 文本探测: "
+            f"pages={page_count}, sample={sample_indexes}, "
+            f"text_pages={text_page_count}/{len(page_char_counts)}, "
+            f"avg_chars={avg_chars:.1f}",
+            flush=True,
+        )
+
+        if text_page_ratio >= 0.6 or avg_chars >= min_chars_per_page:
+            return "txt"
+        if text_page_ratio <= 0.2 and avg_chars < min_chars_per_page:
+            return "ocr"
+        return None
+    except Exception as exc:
+        print(f"提示: PDF 文本探测失败，将保留 MinerU auto 模式: {exc}", flush=True)
+        return None
+
+
+def get_pdf_page_count(file_path: Path) -> int | None:
+    if file_path.suffix.lower() != ".pdf":
+        return None
+    try:
+        from pypdf import PdfReader
+
+        return len(PdfReader(str(file_path)).pages)
+    except Exception:
+        return None
+
+
+def adjust_segment_page_indexes(
+    content_list: list[dict], start_page: int, end_page: int
+) -> None:
+    """Offset page indexes when MinerU returns segment-local page numbers."""
+    page_indexes = [
+        item.get("page_idx")
+        for item in content_list
+        if isinstance(item, dict) and isinstance(item.get("page_idx"), int)
+    ]
+    if not page_indexes or start_page <= 0:
+        return
+
+    segment_len = end_page - start_page + 1
+    if max(page_indexes) <= segment_len + 1:
+        for item in content_list:
+            if isinstance(item, dict) and isinstance(item.get("page_idx"), int):
+                item["page_idx"] += start_page
+
+
+def write_mineru_failure_report(
+    working_dir: str,
+    file_path: Path,
+    failures: list[dict],
+    successes: list[dict],
+) -> Path:
+    report_dir = Path(working_dir) / "mineru_failures"
+    report_dir.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.md5(str(file_path.resolve()).encode("utf-8")).hexdigest()[:12]
+    report_path = report_dir / f"{file_path.stem}_{digest}.json"
+    report = {
+        "file": str(file_path.resolve()),
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "failures": failures,
+        "successes": successes,
+    }
+    report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    return report_path
+
+
+async def parse_document_resilient(
+    rag,
+    *,
+    file_path: Path,
+    output_dir: str,
+    parse_method: str,
+    display_stats: bool,
+    parser_kwargs: dict,
+    working_dir: str,
+    page_window: int,
+    min_page_window: int,
+    segment_large_pages: int,
+) -> tuple[list[dict], str | None]:
+    page_count = get_pdf_page_count(file_path)
+    range_start = parser_kwargs.get("start_page")
+    range_end = parser_kwargs.get("end_page")
+    start_page = int(range_start) if range_start is not None else 0
+    end_page = int(range_end) if range_end is not None else (
+        page_count - 1 if page_count else start_page
+    )
+    segment_first = bool(
+        page_count
+        and segment_large_pages > 0
+        and (end_page - start_page + 1) >= segment_large_pages
+    )
+
+    if not segment_first:
+        try:
+            return await rag.parse_document(
+                file_path=str(file_path),
+                output_dir=output_dir,
+                parse_method=parse_method,
+                display_stats=display_stats,
+                **parser_kwargs,
+            )
+        except MineruExecutionError as exc:
+            if not page_count:
+                raise
+            print(
+                "MinerU 整本解析失败，改用分段容错解析: "
+                f"{exc}",
+                flush=True,
+            )
+    else:
+        print(
+            "MinerU 大文档启用分段容错解析: "
+            f"pages={page_count}, window={page_window}, min_window={min_page_window}",
+            flush=True,
+        )
+
+    failures: list[dict] = []
+    successes: list[dict] = []
+    merged_content: list[dict] = []
+
+    async def parse_range(seg_start: int, seg_end: int) -> None:
+        seg_kwargs = dict(parser_kwargs)
+        seg_kwargs["start_page"] = seg_start
+        seg_kwargs["end_page"] = seg_end
+        try:
+            print(f"MinerU 分段解析: pages {seg_start}-{seg_end}", flush=True)
+            segment_content, _ = await rag.parse_document(
+                file_path=str(file_path),
+                output_dir=output_dir,
+                parse_method=parse_method,
+                display_stats=False,
+                **seg_kwargs,
+            )
+            adjust_segment_page_indexes(segment_content, seg_start, seg_end)
+            merged_content.extend(segment_content)
+            successes.append(
+                {
+                    "start_page": seg_start,
+                    "end_page": seg_end,
+                    "blocks": len(segment_content),
+                }
+            )
+        except MineruExecutionError as exc:
+            if seg_end - seg_start + 1 <= max(1, min_page_window):
+                print(
+                    "MinerU 跳过失败页段: "
+                    f"pages {seg_start}-{seg_end}, error={exc}",
+                    flush=True,
+                )
+                failures.append(
+                    {
+                        "start_page": seg_start,
+                        "end_page": seg_end,
+                        "error": str(exc),
+                    }
+                )
+                return
+            mid = (seg_start + seg_end) // 2
+            await parse_range(seg_start, mid)
+            await parse_range(mid + 1, seg_end)
+
+    page_window = max(1, page_window)
+    current = start_page
+    while current <= end_page:
+        seg_end = min(current + page_window - 1, end_page)
+        await parse_range(current, seg_end)
+        current = seg_end + 1
+
+    if failures:
+        report_path = write_mineru_failure_report(
+            working_dir, file_path, failures, successes
+        )
+        print(f"MinerU 失败页段报告: {report_path}", flush=True)
+    if not merged_content:
+        raise RuntimeError(f"MinerU 分段解析全部失败: {file_path}")
+
+    return merged_content, None
 
 
 def content_item_to_text(item: dict, index: int) -> dict | None:
@@ -119,6 +343,35 @@ def make_text_doc_id(file_path: Path, content_list: list[dict]) -> str:
     return f"qwen-text-{digest.hexdigest()}"
 
 
+def load_source_metadata(raw_json: str | None) -> dict:
+    if not raw_json:
+        return {}
+    try:
+        data = json.loads(raw_json)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"--source-metadata-json 不是合法 JSON: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ValueError("--source-metadata-json 必须是 JSON object。")
+    return data
+
+
+def metadata_for_file(source_metadata: dict, file_path: Path) -> dict:
+    if not source_metadata:
+        return {}
+    by_file = source_metadata.get("files")
+    if isinstance(by_file, dict):
+        file_keys = [
+            str(file_path),
+            str(file_path.resolve()),
+            file_path.name,
+        ]
+        for key in file_keys:
+            item = by_file.get(key)
+            if isinstance(item, dict):
+                return item
+    return source_metadata
+
+
 async def assert_text_insert_succeeded(rag, doc_id: str) -> None:
     status = await rag.lightrag.doc_status.get_by_id(doc_id)
     if not status:
@@ -156,6 +409,7 @@ async def import_files(args: argparse.Namespace) -> None:
         display_content_stats=not args.no_stats,
     )
     storage = normalize_storage(args.storage)
+    source_metadata = load_source_metadata(args.source_metadata_json)
 
     print("Qwen 中文政策文件导入")
     if storage == "postgres":
@@ -207,6 +461,10 @@ async def import_files(args: argparse.Namespace) -> None:
             }
             if args.mineru_device:
                 parser_kwargs["device"] = args.mineru_device
+            if args.start_page is not None:
+                parser_kwargs["start_page"] = args.start_page
+            if args.end_page is not None:
+                parser_kwargs["end_page"] = args.end_page
             if args.model_source:
                 parser_kwargs["source"] = args.model_source
                 parser_kwargs["env"] = {
@@ -214,11 +472,32 @@ async def import_files(args: argparse.Namespace) -> None:
                     "MINERU_MODEL_SOURCE": args.model_source,
                 }
 
+            effective_parse_method = args.parse_method
+            if (
+                args.parser == "mineru"
+                and args.parse_method == "auto"
+                and args.auto_detect_ocr
+            ):
+                inferred_method = infer_pdf_parse_method(
+                    file_path,
+                    sample_pages=args.pdf_probe_pages,
+                    min_chars_per_page=args.pdf_text_min_chars,
+                )
+                if inferred_method:
+                    effective_parse_method = inferred_method
+                    print(
+                        "PDF 自动判定解析模式: "
+                        f"{effective_parse_method} "
+                        f"(抽样页数={args.pdf_probe_pages}, "
+                        f"文本阈值={args.pdf_text_min_chars}/页)",
+                        flush=True,
+                    )
+
             if args.index_mode == "full":
                 await rag.process_document_complete(
                     file_path=str(file_path),
                     output_dir=args.output_dir,
-                    parse_method=args.parse_method,
+                    parse_method=effective_parse_method,
                     display_stats=not args.no_stats,
                     doc_id=doc_id,
                     **parser_kwargs,
@@ -228,24 +507,46 @@ async def import_files(args: argparse.Namespace) -> None:
                 if not init_result.get("success"):
                     raise RuntimeError(init_result.get("error", "LightRAG 初始化失败。"))
 
-                content_list, parsed_doc_id = await rag.parse_document(
-                    file_path=str(file_path),
-                    output_dir=args.output_dir,
-                    parse_method=args.parse_method,
-                    display_stats=not args.no_stats,
-                    **parser_kwargs,
-                )
+                if args.mineru_resilient_pages and args.parser == "mineru":
+                    content_list, parsed_doc_id = await parse_document_resilient(
+                        rag,
+                        file_path=file_path,
+                        output_dir=args.output_dir,
+                        parse_method=effective_parse_method,
+                        display_stats=not args.no_stats,
+                        parser_kwargs=parser_kwargs,
+                        working_dir=args.working_dir,
+                        page_window=args.mineru_page_window,
+                        min_page_window=args.mineru_min_page_window,
+                        segment_large_pages=args.mineru_segment_large_pages,
+                    )
+                else:
+                    content_list, parsed_doc_id = await rag.parse_document(
+                        file_path=str(file_path),
+                        output_dir=args.output_dir,
+                        parse_method=effective_parse_method,
+                        display_stats=not args.no_stats,
+                        **parser_kwargs,
+                    )
                 text_content_list = normalize_content_list_for_text_index(content_list)
                 if not text_content_list:
                     raise RuntimeError(f"解析成功但没有可入库的文本内容: {file_path}")
 
                 text_doc_id = doc_id or make_text_doc_id(file_path, text_content_list)
                 print(f"文本索引模式: doc_id={text_doc_id}")
+                file_source_metadata = metadata_for_file(source_metadata, file_path)
+                if file_source_metadata:
+                    print(
+                        "目录语义 metadata: "
+                        f"business_category={file_source_metadata.get('business_category')}, "
+                        f"relative_path={file_source_metadata.get('relative_path')}"
+                    )
                 if args.chunk_mode == "structured":
                     structured_chunks = build_structured_chunks(
                         text_content_list,
                         doc_id=text_doc_id,
                         file_name=file_path.name,
+                        source_metadata=file_source_metadata,
                     )
                     if not structured_chunks:
                         raise RuntimeError(f"结构化切分没有生成 chunk: {file_path}")
@@ -364,6 +665,60 @@ def parse_args() -> argparse.Namespace:
         help="MinerU 推理设备，例如 cpu、cuda、cuda:0、mps。扫描件建议显式传 cuda。",
     )
     parser.add_argument(
+        "--start-page",
+        type=int,
+        default=None,
+        help="MinerU 起始页，0-based；用于分段解析或定位坏页。",
+    )
+    parser.add_argument(
+        "--end-page",
+        type=int,
+        default=None,
+        help="MinerU 结束页，0-based；用于分段解析或定位坏页。",
+    )
+    parser.add_argument(
+        "--auto-detect-ocr",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="parse-method=auto 时先探测 PDF 是否有可提取文字，自动选择 txt 或 ocr。",
+    )
+    parser.add_argument(
+        "--pdf-probe-pages",
+        type=int,
+        default=int(os.getenv("QWEN_PDF_PROBE_PAGES", "5")),
+        help="自动判定 PDF 解析模式时抽样检查的页数。",
+    )
+    parser.add_argument(
+        "--pdf-text-min-chars",
+        type=int,
+        default=int(os.getenv("QWEN_PDF_TEXT_MIN_CHARS", "80")),
+        help="抽样页平均可提取文字数达到该值时判定为文本型 PDF。",
+    )
+    parser.add_argument(
+        "--mineru-resilient-pages",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="MinerU 解析失败时启用分段重试，局部失败页段会跳过并写入报告。",
+    )
+    parser.add_argument(
+        "--mineru-page-window",
+        type=int,
+        default=int(os.getenv("QWEN_MINERU_PAGE_WINDOW", "100")),
+        help="MinerU 分段容错解析的初始页段大小。",
+    )
+    parser.add_argument(
+        "--mineru-min-page-window",
+        type=int,
+        default=int(os.getenv("QWEN_MINERU_MIN_PAGE_WINDOW", "5")),
+        help="MinerU 分段容错解析的最小页段大小；缩到该大小仍失败则跳过。",
+    )
+    parser.add_argument(
+        "--mineru-segment-large-pages",
+        type=int,
+        default=int(os.getenv("QWEN_MINERU_SEGMENT_LARGE_PAGES", "300")),
+        help="PDF 页数达到该阈值时直接分段解析；传 0 表示先整本解析，失败后再分段。",
+    )
+    parser.add_argument(
         "--index-mode",
         default="text",
         choices=["text", "full"],
@@ -398,6 +753,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--doc-id-prefix",
         help="可选固定 doc_id 前缀；传入后会生成 <prefix>-1、<prefix>-2。",
+    )
+    parser.add_argument(
+        "--source-metadata-json",
+        help=(
+            "可选来源 metadata JSON；批量导入时用于把 source_root、relative_path、"
+            "directory_tags、business_category 等目录语义写入结构化 chunk。"
+        ),
     )
     parser.add_argument(
         "--enable-images",
