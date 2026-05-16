@@ -16,6 +16,7 @@ from pathlib import Path
 from qwen_policy_common import (
     DEFAULT_OUTPUT_DIR,
     DEFAULT_WORKING_DIR,
+    flush_runtime_artifact_records_sync,
     restore_file_from_save,
     sync_file_to_save,
     sync_tree_to_save,
@@ -514,6 +515,7 @@ def run_batch(args: argparse.Namespace) -> None:
     write_report(report_path, manifest)
     sync_tree_to_save(args.working_dir)
     sync_tree_to_save(args.output_dir)
+    flush_runtime_artifact_records_sync()
 
     print("Qwen 中文政策文件批量导入")
     print(f"目录: {root}")
@@ -532,6 +534,7 @@ def run_batch(args: argparse.Namespace) -> None:
     )
 
     if args.scan_only:
+        flush_runtime_artifact_records_sync()
         print("已完成扫描预览，未执行导入。")
         return
 
@@ -607,6 +610,7 @@ def run_batch(args: argparse.Namespace) -> None:
             )
             save_manifest(manifest_path, manifest)
             write_report(report_path, manifest)
+            flush_runtime_artifact_records_sync()
             if not args.continue_on_error:
                 raise RuntimeError(f"批量导入中断，失败文件: {key}")
 
@@ -629,6 +633,9 @@ def run_batch(args: argparse.Namespace) -> None:
     manifest["updated_at"] = iso_now()
     save_manifest(manifest_path, manifest)
     write_report(report_path, manifest)
+    sync_tree_to_save(args.working_dir)
+    sync_tree_to_save(args.output_dir)
+    flush_runtime_artifact_records_sync()
 
     print("\n批量导入完成")
     print(f"成功: {success_count}")

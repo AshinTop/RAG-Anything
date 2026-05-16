@@ -14,7 +14,6 @@ import mimetypes
 import shutil
 import subprocess
 import time
-import asyncio
 from datetime import datetime
 from datetime import timezone
 from pathlib import Path
@@ -46,7 +45,7 @@ DEFAULT_SAVE_ROOT = WORKSPACE_ROOT / "save"
 _GPU_UNAVAILABLE_REPORTED = False
 _RUNTIME_ARTIFACT_WARNING_REPORTED = False
 _RUNTIME_ARTIFACT_DB_DISABLED = False
-_RUNTIME_ARTIFACT_TASKS: set[asyncio.Task] = set()
+_RUNTIME_ARTIFACT_RECORDS: list[dict[str, Any]] = []
 
 LOCAL_STORAGE_BACKENDS = {
     "kv_storage": "JsonKVStorage",
@@ -2219,19 +2218,71 @@ def report_runtime_artifact_warning(exc: Exception) -> None:
     _RUNTIME_ARTIFACT_WARNING_REPORTED = True
     print(
         "提示: runtime_artifacts 自动登记失败，文件已同步到 save；"
-        f"如需入库请先执行 db/schema.sql。错误: {exc}",
+        f"如需入库请确认已执行 db/schema.sql 且 PostgreSQL 连接可用。错误: {exc}",
         flush=True,
     )
 
 
-def runtime_artifact_task_done(task: asyncio.Task) -> None:
-    _RUNTIME_ARTIFACT_TASKS.discard(task)
-    try:
-        exc = task.exception()
-    except asyncio.CancelledError:
-        return
-    if exc:
-        report_runtime_artifact_warning(exc)
+def build_runtime_artifact_record(
+    local_path: str | Path, save_path: str | Path, artifact_type: str | None, metadata: dict[str, Any] | None
+) -> dict[str, Any] | None:
+    source = Path(local_path).expanduser()
+    saved = Path(save_path).expanduser()
+    if not source.is_file() or not saved:
+        return None
+
+    logical_path = path_relative_to_project(source).as_posix()
+    artifact_type = artifact_type or infer_artifact_type(source)
+    mime_type = mimetypes.guess_type(str(source))[0]
+    stat = source.stat()
+    return {
+        "artifact_type": artifact_type,
+        "logical_path": logical_path,
+        "local_path": str(source.resolve()),
+        "save_path": str(saved.resolve()),
+        "file_hash": file_sha256(source),
+        "file_size": stat.st_size,
+        "mime_type": mime_type,
+        "metadata": {
+            "workspace": get_postgres_workspace(),
+            **(metadata or {}),
+        },
+    }
+
+
+async def upsert_runtime_artifact_record(connection: Any, record: dict[str, Any]) -> None:
+    await connection.execute(
+        """
+        INSERT INTO runtime_artifacts (
+            artifact_type,
+            logical_path,
+            local_path,
+            save_path,
+            file_hash,
+            file_size,
+            mime_type,
+            metadata
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)
+        ON CONFLICT (artifact_type, save_path)
+        DO UPDATE SET
+            logical_path = EXCLUDED.logical_path,
+            local_path = EXCLUDED.local_path,
+            file_hash = EXCLUDED.file_hash,
+            file_size = EXCLUDED.file_size,
+            mime_type = EXCLUDED.mime_type,
+            metadata = runtime_artifacts.metadata || EXCLUDED.metadata,
+            updated_at = now()
+        """,
+        record["artifact_type"],
+        record["logical_path"],
+        record["local_path"],
+        record["save_path"],
+        record["file_hash"],
+        record["file_size"],
+        record["mime_type"],
+        json.dumps(record["metadata"], ensure_ascii=False),
+    )
 
 
 async def record_runtime_artifact(
@@ -2244,9 +2295,8 @@ async def record_runtime_artifact(
     if not should_record_runtime_artifacts():
         return
 
-    source = Path(local_path).expanduser()
-    saved = Path(save_path).expanduser()
-    if not source.is_file() or not saved:
+    record = build_runtime_artifact_record(local_path, save_path, artifact_type, metadata)
+    if record is None:
         return
 
     try:
@@ -2254,49 +2304,9 @@ async def record_runtime_artifact(
     except ImportError:
         return
 
-    logical_path = path_relative_to_project(source).as_posix()
-    artifact_type = artifact_type or infer_artifact_type(source)
-    mime_type = mimetypes.guess_type(str(source))[0]
-    stat = source.stat()
-    payload = {
-        "workspace": get_postgres_workspace(),
-        **(metadata or {}),
-    }
-
     connection = await asyncpg.connect(**postgres_connect_kwargs())
     try:
-        await connection.execute(
-            """
-            INSERT INTO runtime_artifacts (
-                artifact_type,
-                logical_path,
-                local_path,
-                save_path,
-                file_hash,
-                file_size,
-                mime_type,
-                metadata
-            )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)
-            ON CONFLICT (artifact_type, save_path)
-            DO UPDATE SET
-                logical_path = EXCLUDED.logical_path,
-                local_path = EXCLUDED.local_path,
-                file_hash = EXCLUDED.file_hash,
-                file_size = EXCLUDED.file_size,
-                mime_type = EXCLUDED.mime_type,
-                metadata = runtime_artifacts.metadata || EXCLUDED.metadata,
-                updated_at = now()
-            """,
-            artifact_type,
-            logical_path,
-            str(source.resolve()),
-            str(saved.resolve()),
-            file_sha256(source),
-            stat.st_size,
-            mime_type,
-            json.dumps(payload, ensure_ascii=False),
-        )
+        await upsert_runtime_artifact_record(connection, record)
     finally:
         await connection.close()
 
@@ -2310,41 +2320,44 @@ def schedule_runtime_artifact_record(
 ) -> None:
     if not should_record_runtime_artifacts():
         return
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        try:
-            asyncio.run(
-                record_runtime_artifact(
-                    local_path,
-                    save_path,
-                    artifact_type=artifact_type,
-                    metadata=metadata,
-                )
-            )
-        except Exception as exc:
-            report_runtime_artifact_warning(exc)
+    record = build_runtime_artifact_record(local_path, save_path, artifact_type, metadata)
+    if record is None:
         return
-
-    task = loop.create_task(
-        record_runtime_artifact(
-            local_path,
-            save_path,
-            artifact_type=artifact_type,
-            metadata=metadata,
-        )
-    )
-    _RUNTIME_ARTIFACT_TASKS.add(task)
-    task.add_done_callback(runtime_artifact_task_done)
+    _RUNTIME_ARTIFACT_RECORDS.append(record)
 
 
 async def flush_runtime_artifact_records() -> None:
-    if not _RUNTIME_ARTIFACT_TASKS:
+    if not should_record_runtime_artifacts() or not _RUNTIME_ARTIFACT_RECORDS:
         return
-    results = await asyncio.gather(*list(_RUNTIME_ARTIFACT_TASKS), return_exceptions=True)
-    for result in results:
-        if isinstance(result, Exception):
-            report_runtime_artifact_warning(result)
+    try:
+        import asyncpg
+    except ImportError:
+        return
+
+    records = list(_RUNTIME_ARTIFACT_RECORDS)
+    _RUNTIME_ARTIFACT_RECORDS.clear()
+    deduped = {
+        (record["artifact_type"], record["save_path"]): record for record in records
+    }
+    connection = None
+    try:
+        connection = await asyncpg.connect(**postgres_connect_kwargs())
+        for record in deduped.values():
+            await upsert_runtime_artifact_record(connection, record)
+    except Exception as exc:
+        report_runtime_artifact_warning(exc)
+    finally:
+        if connection is not None:
+            await connection.close()
+
+
+def flush_runtime_artifact_records_sync() -> None:
+    if not should_record_runtime_artifacts() or not _RUNTIME_ARTIFACT_RECORDS:
+        return
+    try:
+        asyncio.run(flush_runtime_artifact_records())
+    except Exception as exc:
+        report_runtime_artifact_warning(exc)
 
 
 def resolve_path_from_save(path: str | Path) -> Path:

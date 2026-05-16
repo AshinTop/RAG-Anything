@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -18,6 +19,7 @@ SECTION_RE = re.compile(rf"^(第{HEADING_NUM}节)\s*(.+)$")
 ARTICLE_RE = re.compile(rf"^(第{HEADING_NUM}条)\s*(.*)$")
 TABLE_RE = re.compile(r"^\[表格[，,]\s*第\s*(\d+)\s*页[，,]\s*块\s*(\d+)\]")
 PAGE_RE = re.compile(r"第\s*(\d+)\s*页")
+DEFAULT_MAX_CHUNK_CHARS = 3500
 
 
 @dataclass
@@ -108,6 +110,47 @@ def page_from_text(text: str, fallback: int | None) -> int | None:
     return fallback
 
 
+def max_structured_chunk_chars() -> int:
+    try:
+        return max(500, int(os.getenv("QWEN_STRUCTURED_CHUNK_MAX_CHARS", str(DEFAULT_MAX_CHUNK_CHARS))))
+    except Exception:
+        return DEFAULT_MAX_CHUNK_CHARS
+
+
+def split_long_text(text: str, max_chars: int) -> list[str]:
+    text = normalize_ws(text)
+    if len(text) <= max_chars:
+        return [text] if text else []
+
+    segments: list[str] = []
+    current: list[str] = []
+    current_len = 0
+    for paragraph in split_paragraphs(text):
+        if len(paragraph) > max_chars:
+            if current:
+                segments.append(normalize_ws("\n\n".join(current)))
+                current = []
+                current_len = 0
+            for start in range(0, len(paragraph), max_chars):
+                part = paragraph[start : start + max_chars].strip()
+                if part:
+                    segments.append(part)
+            continue
+
+        extra_len = len(paragraph) + (2 if current else 0)
+        if current and current_len + extra_len > max_chars:
+            segments.append(normalize_ws("\n\n".join(current)))
+            current = [paragraph]
+            current_len = len(paragraph)
+        else:
+            current.append(paragraph)
+            current_len += extra_len
+
+    if current:
+        segments.append(normalize_ws("\n\n".join(current)))
+    return [segment for segment in segments if segment]
+
+
 def build_structured_chunks(
     text_items: list[dict[str, Any]],
     *,
@@ -122,6 +165,34 @@ def build_structured_chunks(
     current_parts: list[str] = []
     current_page_idx: int | None = None
     current_start_block: int | None = None
+    max_chunk_chars = max_structured_chunk_chars()
+
+    def append_chunk(
+        *,
+        page_idx: int | None,
+        article_no: str | None,
+        content_type: str,
+        content: str,
+        source_block_range: list[int],
+    ) -> None:
+        for segment in split_long_text(content, max_chunk_chars):
+            order = len(chunks)
+            chunks.append(
+                StructuredChunk(
+                    doc_id=doc_id,
+                    chunk_id=f"{doc_id}-chunk-{order:04d}",
+                    chunk_order_index=order,
+                    file_name=file_name,
+                    page_idx=page_idx,
+                    chapter_title=chapter_title,
+                    section_title=section_title,
+                    article_no=article_no,
+                    content_type=content_type,
+                    content=segment,
+                    source_block_range=source_block_range,
+                    source_metadata=source_metadata,
+                )
+            )
 
     def flush_article(end_block: int) -> None:
         nonlocal current_article_no, current_parts, current_page_idx, current_start_block
@@ -132,22 +203,12 @@ def build_structured_chunks(
             current_page_idx = None
             current_start_block = None
             return
-        order = len(chunks)
-        chunks.append(
-            StructuredChunk(
-                doc_id=doc_id,
-                chunk_id=f"{doc_id}-chunk-{order:04d}",
-                chunk_order_index=order,
-                file_name=file_name,
-                page_idx=current_page_idx,
-                chapter_title=chapter_title,
-                section_title=section_title,
-                article_no=current_article_no,
-                content_type="article" if current_article_no else "section_text",
-                content=content,
-                source_block_range=[current_start_block or end_block, end_block],
-                source_metadata=source_metadata,
-            )
+        append_chunk(
+            page_idx=current_page_idx,
+            article_no=current_article_no,
+            content_type="article" if current_article_no else "section_text",
+            content=content,
+            source_block_range=[current_start_block or end_block, end_block],
         )
         current_article_no = None
         current_parts = []
@@ -155,22 +216,12 @@ def build_structured_chunks(
         current_start_block = None
 
     def add_table(paragraph: str, page_idx: int | None, block_index: int) -> None:
-        order = len(chunks)
-        chunks.append(
-            StructuredChunk(
-                doc_id=doc_id,
-                chunk_id=f"{doc_id}-chunk-{order:04d}",
-                chunk_order_index=order,
-                file_name=file_name,
-                page_idx=page_idx,
-                chapter_title=chapter_title,
-                section_title=section_title,
-                article_no=current_article_no,
-                content_type="table",
-                content=paragraph,
-                source_block_range=[block_index, block_index],
-                source_metadata=source_metadata,
-            )
+        append_chunk(
+            page_idx=page_idx,
+            article_no=current_article_no,
+            content_type="table",
+            content=paragraph,
+            source_block_range=[block_index, block_index],
         )
 
     for block_index, item in enumerate(text_items):
