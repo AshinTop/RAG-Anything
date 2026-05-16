@@ -16,11 +16,14 @@ from qwen_policy_common import (
     DEFAULT_WORKING_DIR,
     STRICT_ANSWER_SYSTEM_PROMPT,
     build_chunk_focused_context,
+    build_extractive_clause_answer,
+    build_extractive_table_answer,
     build_protected_table_answer_prefix,
     build_strict_answer_prompt,
     build_qwen_policy_rag,
     clean_answer_text,
     load_index_chunks,
+    merge_protected_table_answer,
     normalize_storage,
 )
 from lightrag import QueryParam
@@ -187,9 +190,13 @@ async def query(args: argparse.Namespace) -> None:
                     question, focused_context
                 )
                 if protected_table_prefix:
-                    answer = protected_table_prefix
+                    answer = build_extractive_table_answer(
+                        question, focused_context, protected_table_prefix
+                    ) or merge_protected_table_answer(str(answer), protected_table_prefix)
                 else:
-                    answer = clean_answer_text(str(answer))
+                    answer = build_extractive_clause_answer(
+                        question, focused_context
+                    ) or clean_answer_text(str(answer))
             else:
                 answer = await rag.aquery(
                     question,
