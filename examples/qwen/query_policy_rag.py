@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import re
 import sys
 from datetime import datetime
@@ -39,6 +40,23 @@ from lightrag import QueryParam
 
 
 DEFAULT_QA_OUTPUT_DIR = str(Path(__file__).resolve().parents[2] / "output" / "qwen_policy_qa")
+
+
+def env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
 
 
 def local_index_has_chunks(working_dir: Path) -> bool:
@@ -287,7 +305,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--storage",
-        default="postgres",
+        default=os.getenv("QWEN_STORAGE", "postgres"),
         choices=["local", "postgres", "pg", "postgresql", "postgres-age", "pg-age"],
         help=(
             "索引存储后端，默认 postgres。local=本地文件；postgres=PostgreSQL KV/向量/状态 + "
@@ -296,36 +314,38 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--parser",
-        default="mineru",
+        default=os.getenv("PARSER", "mineru"),
         choices=["mineru", "docling", "paddleocr"],
         help="初始化 RAG-Anything 时使用的解析器名称。",
     )
     parser.add_argument(
         "--mode",
-        default="naive",
+        default=os.getenv("QWEN_QA_MODE", "naive"),
         choices=["hybrid", "local", "global", "naive", "mix", "bypass"],
         help="LightRAG 查询模式；中文政策原文问答默认使用 naive，避免图谱检索带偏。",
     )
     parser.add_argument(
         "--top-k",
         type=int,
-        default=40,
+        default=env_int("QWEN_QA_TOP_K", 40),
         help="最多检索多少个实体/关系。",
     )
     parser.add_argument(
         "--chunk-top-k",
         type=int,
-        default=20,
+        default=env_int("QWEN_QA_CHUNK_TOP_K", 20),
         help="最多检索多少个文本块。",
     )
     parser.add_argument(
         "--enable-rerank",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=env_bool("QWEN_QA_ENABLE_RERANK", False),
         help="启用 rerank，前提是已配置 rerank 模型。",
     )
     parser.add_argument(
         "--vlm",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=env_bool("QWEN_QA_VLM", False),
         help="启用 VLM 图片增强；本地 Qwen3 8B 默认不建议开启。",
     )
     parser.add_argument(
@@ -336,24 +356,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--strict-answer",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=env_bool("QWEN_QA_STRICT_ANSWER", True),
         help="先获取 LightRAG 原始检索提示，再用抽取式 prompt 生成答案。",
     )
     parser.add_argument(
         "--dump-prompt",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=env_bool("QWEN_QA_DUMP_PROMPT", True),
         help="默认打印 LightRAG 生成的原始检索提示；传 --no-dump-prompt 可关闭。",
     )
     parser.add_argument(
         "--save-output",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=env_bool("QWEN_QA_SAVE_OUTPUT", True),
         help="默认每个 QA 保存一个本地 text 文件；传 --no-save-output 可关闭。",
     )
     parser.add_argument(
         "--qa-output-dir",
-        default=DEFAULT_QA_OUTPUT_DIR,
+        default=os.getenv("QWEN_QA_OUTPUT_DIR", DEFAULT_QA_OUTPUT_DIR),
         help="QA 结果保存目录，默认 output/qwen_policy_qa。",
     )
     return parser.parse_args()
