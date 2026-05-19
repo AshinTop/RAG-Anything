@@ -21,6 +21,7 @@ from qwen_policy_common import (
     normalize_storage,
     resolve_input_paths,
     restore_path_from_save,
+    set_runtime_import_job_id,
     sync_file_to_save,
     sync_tree_to_save,
 )
@@ -398,6 +399,7 @@ async def assert_text_insert_succeeded(rag, doc_id: str) -> None:
 
 
 async def import_files(args: argparse.Namespace) -> None:
+    args.import_job_id = set_runtime_import_job_id(args.import_job_id)
     restore_path_from_save(args.working_dir)
     files = resolve_input_paths(args.files, recursive=args.recursive)
     if not files:
@@ -453,6 +455,7 @@ async def import_files(args: argparse.Namespace) -> None:
     print(f"索引模式: {args.index_mode}")
     print(f"QA 策略: {'structured_retrieval_first' if args.retrieval_only else 'default_lightrag'}")
     print(f"存储后端: {describe_storage_backends(storage)}")
+    print(f"import_job_id: {args.import_job_id}")
     print(f"待导入文件数: {len(files)}")
 
     try:
@@ -769,6 +772,11 @@ def parse_args() -> argparse.Namespace:
             "可选来源 metadata JSON；批量导入时用于把 source_root、relative_path、"
             "directory_tags、business_category 等目录语义写入结构化 chunk。"
         ),
+    )
+    parser.add_argument(
+        "--import-job-id",
+        default=os.getenv("QWEN_IMPORT_JOB_ID"),
+        help="导入任务 UUID；默认自动生成。批量脚本会传入同一个任务 ID。",
     )
     parser.add_argument(
         "--enable-images",

@@ -21,6 +21,7 @@ from qwen_policy_common import (
     insert_retrieval_only_chunks,
     normalize_storage,
     restore_path_from_save,
+    set_runtime_import_job_id,
     sync_tree_to_save,
 )
 from import_policy_files import (
@@ -232,6 +233,7 @@ def resolve_content_list_paths(paths: list[str], recursive: bool) -> list[Path]:
 
 
 async def import_parsed_content_lists(args: argparse.Namespace) -> None:
+    args.import_job_id = set_runtime_import_job_id(args.import_job_id)
     restore_path_from_save(args.working_dir)
     files = resolve_content_list_paths(args.content_lists, recursive=args.recursive)
     if not files:
@@ -246,6 +248,7 @@ async def import_parsed_content_lists(args: argparse.Namespace) -> None:
     print(f"工作目录: {Path(args.working_dir).resolve()}")
     print(f"QA 策略: {'structured_retrieval_first' if args.retrieval_only else 'default_lightrag'}")
     print(f"存储后端: {describe_storage_backends(storage)}")
+    print(f"import_job_id: {args.import_job_id}")
     print(f"待导入 content_list 数: {len(files)}")
 
     if args.dry_run:
@@ -388,6 +391,11 @@ def parse_args() -> argparse.Namespace:
         help="原始文件路径或引用名；只适用于单个 content_list。",
     )
     parser.add_argument("--doc-id", help="可选固定 doc_id；只建议单文件导入时使用。")
+    parser.add_argument(
+        "--import-job-id",
+        default=None,
+        help="导入任务 UUID；默认自动生成。",
+    )
     parser.add_argument(
         "--dry-run",
         action="store_true",

@@ -18,6 +18,7 @@ from qwen_policy_common import (
     DEFAULT_WORKING_DIR,
     flush_runtime_artifact_records_sync,
     restore_file_from_save,
+    set_runtime_import_job_id,
     sync_file_to_save,
     sync_tree_to_save,
 )
@@ -439,6 +440,8 @@ def build_import_command(args: argparse.Namespace, file_item: dict) -> list[str]
     ])
     if not args.no_stable_doc_id:
         command.extend(["--doc-id-prefix", file_item["doc_id_prefix"]])
+    if args.import_job_id:
+        command.extend(["--import-job-id", args.import_job_id])
     command.extend([
         "--source-metadata-json",
         json.dumps(source_metadata_for_import(file_item), ensure_ascii=False),
@@ -460,6 +463,7 @@ def build_import_command(args: argparse.Namespace, file_item: dict) -> list[str]
 def run_batch(args: argparse.Namespace) -> None:
     if args.large_file_pages is not None and args.large_file_pages <= 0:
         args.large_file_pages = None
+    args.import_job_id = set_runtime_import_job_id(args.import_job_id)
 
     root = Path(args.folder).expanduser()
     if not root.exists():
@@ -506,6 +510,7 @@ def run_batch(args: argparse.Namespace) -> None:
             "working_dir": args.working_dir,
             "output_dir": args.output_dir,
             "chunk_mode": args.chunk_mode,
+            "import_job_id": args.import_job_id,
             "scan_summary": summarize_items(items),
             "files": file_records,
             "updated_at": iso_now(),
@@ -527,6 +532,7 @@ def run_batch(args: argparse.Namespace) -> None:
     print(f"chunk_mode: {args.chunk_mode}")
     print(f"storage: {args.storage}")
     print(f"working_dir: {args.working_dir}")
+    print(f"import_job_id: {args.import_job_id}")
     page_threshold = args.large_file_pages if args.large_file_pages is not None else "off"
     print(
         f"large_file_policy: {args.large_file_policy} "
@@ -781,6 +787,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--manifest", default=None, help="导入进度 manifest 路径。")
     parser.add_argument("--report", default=None, help="导入报告 markdown 路径。")
+    parser.add_argument(
+        "--import-job-id",
+        default=os.getenv("QWEN_IMPORT_JOB_ID"),
+        help="导入任务 UUID；默认自动生成，并传递给每个单文件子任务。",
+    )
     return parser.parse_args()
 
 

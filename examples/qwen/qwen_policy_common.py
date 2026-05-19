@@ -18,6 +18,7 @@ from datetime import datetime
 from datetime import timezone
 from pathlib import Path
 from typing import Any
+from uuid import UUID, uuid4
 
 import numpy as np
 from openai import AsyncOpenAI
@@ -46,6 +47,7 @@ _GPU_UNAVAILABLE_REPORTED = False
 _RUNTIME_ARTIFACT_WARNING_REPORTED = False
 _RUNTIME_ARTIFACT_DB_DISABLED = False
 _RUNTIME_ARTIFACT_RECORDS: list[dict[str, Any]] = []
+_RUNTIME_IMPORT_JOB_ID: str | None = None
 
 LOCAL_STORAGE_BACKENDS = {
     "kv_storage": "JsonKVStorage",
@@ -2210,6 +2212,26 @@ def should_record_runtime_artifacts() -> bool:
     return storage in {"postgres", "postgres-age"} and env_bool("QWEN_ARTIFACT_DB_SYNC", True)
 
 
+def set_runtime_import_job_id(import_job_id: str | None = None) -> str:
+    """Set the import job id used by runtime_artifacts for this process."""
+    global _RUNTIME_IMPORT_JOB_ID
+    value = str(import_job_id or os.getenv("QWEN_IMPORT_JOB_ID") or uuid4()).strip()
+    normalized = str(UUID(value))
+    _RUNTIME_IMPORT_JOB_ID = normalized
+    os.environ["QWEN_IMPORT_JOB_ID"] = normalized
+    return normalized
+
+
+def get_runtime_import_job_id() -> str | None:
+    value = (_RUNTIME_IMPORT_JOB_ID or os.getenv("QWEN_IMPORT_JOB_ID") or "").strip()
+    if not value:
+        return None
+    try:
+        return str(UUID(value))
+    except ValueError:
+        return None
+
+
 def report_runtime_artifact_warning(exc: Exception) -> None:
     global _RUNTIME_ARTIFACT_WARNING_REPORTED, _RUNTIME_ARTIFACT_DB_DISABLED
     _RUNTIME_ARTIFACT_DB_DISABLED = True
@@ -2243,6 +2265,7 @@ def build_runtime_artifact_record(
         "file_hash": file_sha256(source),
         "file_size": stat.st_size,
         "mime_type": mime_type,
+        "import_job_id": get_runtime_import_job_id(),
         "metadata": {
             "workspace": get_postgres_workspace(),
             **(metadata or {}),
@@ -2250,10 +2273,54 @@ def build_runtime_artifact_record(
     }
 
 
+async def ensure_runtime_import_job_record(connection: Any, import_job_id: str | None) -> None:
+    if not import_job_id:
+        return
+
+    knowledge_base_id = await connection.fetchval(
+        """
+        SELECT id
+        FROM knowledge_bases
+        WHERE is_default IS TRUE
+        ORDER BY created_at ASC
+        LIMIT 1
+        """
+    )
+    if knowledge_base_id is None:
+        knowledge_base_id = await connection.fetchval(
+            """
+            INSERT INTO knowledge_bases (name, description, domain, is_default)
+            VALUES ('Default Knowledge Base', 'Default policy document knowledge base', 'natural_resources', true)
+            RETURNING id
+            """
+        )
+
+    await connection.execute(
+        """
+        INSERT INTO import_jobs (
+            id,
+            knowledge_base_id,
+            status,
+            total_count,
+            success_count,
+            failed_count,
+            current_stage,
+            started_at
+        )
+        VALUES ($1, $2, 'running', 0, 0, 0, 'uploaded', now())
+        ON CONFLICT (id) DO NOTHING
+        """,
+        UUID(import_job_id),
+        knowledge_base_id,
+    )
+
+
 async def upsert_runtime_artifact_record(connection: Any, record: dict[str, Any]) -> None:
+    await ensure_runtime_import_job_record(connection, record.get("import_job_id"))
     await connection.execute(
         """
         INSERT INTO runtime_artifacts (
+            import_job_id,
             artifact_type,
             logical_path,
             local_path,
@@ -2263,9 +2330,10 @@ async def upsert_runtime_artifact_record(connection: Any, record: dict[str, Any]
             mime_type,
             metadata
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb)
         ON CONFLICT (artifact_type, save_path)
         DO UPDATE SET
+            import_job_id = EXCLUDED.import_job_id,
             logical_path = EXCLUDED.logical_path,
             local_path = EXCLUDED.local_path,
             file_hash = EXCLUDED.file_hash,
@@ -2274,6 +2342,7 @@ async def upsert_runtime_artifact_record(connection: Any, record: dict[str, Any]
             metadata = runtime_artifacts.metadata || EXCLUDED.metadata,
             updated_at = now()
         """,
+        UUID(record["import_job_id"]) if record.get("import_job_id") else None,
         record["artifact_type"],
         record["logical_path"],
         record["local_path"],
